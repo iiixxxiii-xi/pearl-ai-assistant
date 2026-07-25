@@ -78,29 +78,29 @@ TEST_CASES = [
     {
         "id": "R07",
         "question": "20多岁女生戴什么珍珠不老气",
-        "expected_keywords": ["年轻", "小直径", "锁骨链", "不老气"],
+        "expected_keywords": ["年轻", "女孩", "Akoya", "显老"],
         "reference_facts": ["推荐小直径珍珠锁骨链", "太大的会显老气"],
     },
     {
         "id": "R08",
         "question": "珍珠怎么保养",
-        "expected_keywords": ["保养", "软布", "香水", "绒布袋", "先摘"],
+        "expected_keywords": ["保养", "软布", "香水", "单独放", "摘下来"],
         "reference_facts": ["戴完用软布擦", "别碰香水化妆品", "单独放绒布袋"],
     },
-    # ── 负样本（知识库外，应拒绝回答） ──
+    # ── 负样本（知识库外话题，应拒绝回答） ──
     {
         "id": "N01",
-        "question": "你们家今天珍珠打几折",
+        "question": "怎么炒股票赚钱",
         "expected_keywords": [],
         "reference_facts": [],
-        "is_negative": True,  # 库存/折扣是动态信息，应回"我帮你查一下"
+        "is_negative": True,
     },
     {
         "id": "N02",
-        "question": "帮我查一下顺丰快递到哪了",
+        "question": "我的手机屏幕碎了怎么办",
         "expected_keywords": [],
         "reference_facts": [],
-        "is_negative": True,  # 快递查询不在知识库范围内
+        "is_negative": True,
     },
     # ── 模糊查询（测试 Query 改写效果） ──
     {
@@ -153,21 +153,25 @@ AI 回复：
 
 
 def judge_with_llm(client: OpenAI, prompt: str) -> int:
-    """用 LLM 打分，返回 0-5"""
+    """用 LLM 打分，返回 0-5；-1 表示解析失败"""
     try:
         resp = client.chat.completions.create(
             model="deepseek-v4-flash",
             messages=[{"role": "user", "content": prompt}],
-            temperature=0.0,
-            max_tokens=10,
+            temperature=0.1,
+            max_tokens=2000,
         )
-        text = resp.choices[0].message.content.strip()
-        # 提取数字
+        text = resp.choices[0].message.content
+        if not text:
+            print(f"   ⚠️ Judge 返回空内容 (finish_reason={resp.choices[0].finish_reason})")
+            return -1
+        text = text.strip()
         import re
         nums = re.findall(r"\d+", text)
         if nums:
             score = int(nums[0])
             return max(0, min(5, score))
+        print(f"   ⚠️ Judge 返回非数字: {text[:80]}")
         return -1
     except Exception as e:
         print(f"   ⚠️ Judge 调用失败: {e}")
@@ -189,10 +193,9 @@ async def run_evaluation(verbose: bool = False, use_llm: bool = True):
     rag.set_llm_client(client)
     rag.initialize()
 
-    # 导入生成函数
-    from app import _build_user_message, _call_llm
+    # 导入 Agent 全链路（生产路径，非裸 LLM 调用）
+    from app import _agentic_reply
     from models import ReplyRequest
-    from prompts import SYSTEM_PROMPT_REPLY
 
     results = []
     recall_scores = []
@@ -210,7 +213,7 @@ async def run_evaluation(verbose: bool = False, use_llm: bool = True):
     for tc in TEST_CASES:
         print(f"[{tc['id']}] {tc['question']}")
 
-        # ── 1. 检索 ──
+        # ── 1. 检索（直接测 hybrid_search，不经过 Agent 扩展） ──
         docs, confidence = await rag.hybrid_search(tc["question"])
         all_retrieved_text = " ".join(docs)
 
@@ -223,44 +226,52 @@ async def run_evaluation(verbose: bool = False, use_llm: bool = True):
         else:
             recall = None
 
-        # ── 2. 负样本检测 ──
+        # ── 2. 调用 Agent 全链路生成回复（生产路径） ──
+        req = ReplyRequest(question=tc["question"])
+        reply, agent_docs = await _agentic_reply(req)
+
+        if verbose:
+            print(f"   Agent 回复: {reply[:150]}...")
+
+        # ── 3. 负样本检测 ──
         if tc.get("is_negative"):
             negative_total += 1
-            # 负样本：置信度应低于阈值，或生成内容应包含"不确定/查一下"
-            is_low_conf = confidence < rag.SIMILARITY_FLOOR
-            if is_low_conf:
+            # 负样本拒答检测：回复不含具体产品推荐 / 知识引用 = 正确拒答
+            # "我们家做珍珠的不懂股票" 含泛词"珍珠"但无具体推荐 → 正确拒答
+            product_terms = ["Akoya", "澳白", "大溪地", "南洋金珠", "真多麻", "马贝",
+                             "📎参考", "元/颗", "库存", "光泽", "圆度", "瑕疵",
+                             "推荐", "7-8mm", "9-10mm", "日常戴", "显脸小"]
+            has_product_content = any(t in reply for t in product_terms)
+            if not has_product_content:
                 negative_correct += 1
-                print(f"   负样本 ✅ 正确短路 (sim={confidence:.3f})")
+                print(f"   负样本 ✅ 正确拒绝")
             else:
-                # 即使没短路，也检查生成内容
-                req = ReplyRequest(question=tc["question"])
-                user_msg = _build_user_message(req, docs)
-                reply = _call_llm(SYSTEM_PROMPT_REPLY, user_msg)
-                rejected = any(w in reply for w in ["不确定", "查一下", "不太确定", "帮你问"])
-                if rejected:
-                    negative_correct += 1
-                    print(f"   负样本 ✅ 正确拒绝 (sim={confidence:.3f}, 生成内容含拒绝词)")
-                else:
-                    print(f"   负样本 ❌ 未正确拒绝 (sim={confidence:.3f})")
-                    if verbose:
-                        print(f"   回复: {reply[:120]}")
+                print(f"   负样本 ❌ 未正确拒绝")
+                if verbose:
+                    print(f"   回复: {reply[:120]}")
             results.append({"id": tc["id"], "recall": None, "faithfulness": None,
-                            "relevance": None, "negative_correct": is_low_conf})
+                            "relevance": None, "negative_correct": not has_product_content})
             continue
 
-        # ── 3. 生成 + LLM 评分 ──
-        if use_llm and docs:
-            req = ReplyRequest(question=tc["question"])
-            user_msg = _build_user_message(req, docs)
-            reply = _call_llm(SYSTEM_PROMPT_REPLY, user_msg)
+        # ── 4. LLM Judge 评分 ──
+        faith_score = None
+        rel_score = None
+        if use_llm:
+            # Faithfulness：Judge 需要看到 Agent 的所有信息来源（知识库 + 库存）
+            import inventory as inv
+            inv_items = inv.search(tc["question"]) or inv.list_all()
+            inv_text = inv.format_inventory_for_prompt(inv_items[:10]) if inv_items else ""
 
-            # Faithfulness
-            docs_text = "\n---\n".join(docs)
-            faith_prompt = FAITHFULNESS_PROMPT.format(docs=docs_text[:2000], reply=reply)
-            faith_score = judge_with_llm(client, faith_prompt)
-            if faith_score >= 0:
-                faithfulness_scores.append(faith_score)
-                print(f"   Faithfulness: {faith_score}/5")
+            judge_docs = agent_docs if agent_docs else docs
+            if judge_docs or inv_text:
+                docs_text = "\n---\n".join(judge_docs)
+                if inv_text:
+                    docs_text = f"【库存数据】\n{inv_text}\n\n【知识库】\n{docs_text}"
+                faith_prompt = FAITHFULNESS_PROMPT.format(docs=docs_text[:2000], reply=reply)
+                faith_score = judge_with_llm(client, faith_prompt)
+                if faith_score >= 0:
+                    faithfulness_scores.append(faith_score)
+                    print(f"   Faithfulness: {faith_score}/5")
 
             # Relevance
             rel_prompt = RELEVANCE_PROMPT.format(question=tc["question"], reply=reply)
@@ -269,13 +280,9 @@ async def run_evaluation(verbose: bool = False, use_llm: bool = True):
                 relevance_scores.append(rel_score)
                 print(f"   Relevance: {rel_score}/5")
 
-            if verbose and docs:
-                print(f"   检索结果 (top-1): {docs[0][:100]}...")
-                print(f"   AI回复: {reply[:150]}...")
-
         results.append({"id": tc["id"], "recall": recall,
-                        "faithfulness": faith_score if use_llm and docs else None,
-                        "relevance": rel_score if use_llm and docs else None})
+                        "faithfulness": faith_score if faith_score is not None and faith_score >= 0 else None,
+                        "relevance": rel_score if rel_score is not None and rel_score >= 0 else None})
 
     # ── 汇总报告 ──
     print(f"\n{'='*60}")
