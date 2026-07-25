@@ -27,13 +27,13 @@ def _try_connect_redis():
         return _redis_client
     try:
         import redis
-        client = redis.Redis.from_url(REDIS_URL, socket_connect_timeout=2, decode_responses=True)
+        client = redis.Redis.from_url(REDIS_URL, socket_connect_timeout=2, decode_responses=True, protocol=2)
         client.ping()
         _redis_client = client
         print(f"[cache] Redis 连接成功 — {REDIS_URL}")
         return client
-    except Exception:
-        print(f"[cache] Redis 不可用，使用内存缓存")
+    except Exception as e:
+        print(f"[cache] Redis 不可用({e})，使用内存缓存")
         return None
 
 
