@@ -9,6 +9,7 @@ import queue
 import asyncio
 import logging
 import threading
+from datetime import datetime, timezone
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import AsyncGenerator
@@ -93,6 +94,73 @@ class AgenticMetrics:
 _agentic_metrics = AgenticMetrics()
 
 
+# ---- Agent Trace 日志 — ReAct 决策链结构化记录 ----
+import uuid
+import time as _time_module
+
+_TRACE_LOG_FILE = Path(__file__).parent / "agent_trace.jsonl"
+_trace_log_lock = threading.Lock()
+
+
+def _save_trace(trace: dict):
+    """持久化一条 Agent Trace 到 JSONL"""
+    try:
+        trace["ts"] = datetime.now(timezone.utc).isoformat()
+        with _trace_log_lock:
+            with open(_TRACE_LOG_FILE, "a", encoding="utf-8") as f:
+                f.write(json.dumps(trace, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+# ---- MCP Client — 连接 MCP 库存服务 ----
+_mcp_session = None
+_mcp_stdio_ctx = None
+_mcp_session_ctx = None
+
+
+async def _init_mcp():
+    """启动 MCP 库存 Server 并建立 Client 连接。
+    通过 stdio 子进程通信，Agent 通过标准 MCP 协议发现和调用库存工具。
+    """
+    global _mcp_session, _mcp_stdio_ctx, _mcp_session_ctx
+    from mcp.client.stdio import stdio_client
+    from mcp import StdioServerParameters
+    from mcp.client.session import ClientSession
+
+    server_script = str(Path(__file__).parent / "mcp_inventory_server.py")
+    server_params = StdioServerParameters(
+        command="python",
+        args=[server_script],
+    )
+
+    # 手动管理 context manager 生命周期（避免 AsyncExitStack 卡住）
+    _mcp_stdio_ctx = stdio_client(server_params)
+    read, write = await _mcp_stdio_ctx.__aenter__()
+    _mcp_session_ctx = ClientSession(read, write)
+    _mcp_session = await _mcp_session_ctx.__aenter__()
+    await _mcp_session.initialize()
+    print("[MCP] 库存服务连接成功 — Agent 可通过 MCP 协议发现和调用库存工具")
+
+
+async def _shutdown_mcp():
+    """关闭 MCP 连接和子进程"""
+    global _mcp_session, _mcp_stdio_ctx, _mcp_session_ctx
+    try:
+        if _mcp_session_ctx:
+            await _mcp_session_ctx.__aexit__(None, None, None)
+    except Exception:
+        pass
+    try:
+        if _mcp_stdio_ctx:
+            await _mcp_stdio_ctx.__aexit__(None, None, None)
+    except Exception:
+        pass
+    _mcp_session = None
+    _mcp_stdio_ctx = None
+    _mcp_session_ctx = None
+
+
 # ============================================================
 # Lifespan — 启动时加载模型，关闭时清理
 # ============================================================
@@ -106,12 +174,15 @@ async def lifespan(application: FastAPI):
         rag.set_llm_client(_llm_client)
         # 加载模型和知识库（耗时操作，在 lifespan 里做不会阻塞 import）
         rag.initialize()
+        # 启动 MCP 库存服务
+        await _init_mcp()
         print("   服务就绪: http://localhost:8000\n")
     except Exception as e:
         print(f"   ❌ 启动失败: {e}")
         print("   请检查: 1) .env 里 DEEPSEEK_API_KEY 是否填写  2) chroma_db/ 是否存在（先跑 python build_knowledge.py）")
     yield
-    # shutdown 时暂无清理需求
+    # shutdown — 清理 MCP 连接
+    await _shutdown_mcp()
 
 
 app = FastAPI(title="珍珠 AI 助手", version="0.3.0", lifespan=lifespan)
@@ -304,8 +375,28 @@ async def _handle_search_knowledge(args: dict) -> tuple[str, list[str]]:
 
 
 async def _handle_check_inventory(args: dict) -> tuple[str, list[str]]:
-    """查询库存"""
+    """查询库存 — 通过 MCP 协议调用库存服务（而非直接 import inventory）"""
     kw = args.get("keyword", "")
+    # 通过 MCP 协议调用库存工具
+    if _mcp_session:
+        try:
+            result = await _mcp_session.call_tool("check_inventory", {"query": kw})
+            items_text = result.content[0].text if result.content else ""
+            if not items_text or "暂无匹配" in items_text:
+                return (
+                    f"⚠️ 库存中没有找到「{kw}」。请用更短更宽泛的关键词（只搜品种名'Akoya'），"
+                    "调用 check_inventory 再查一次。查不到就诚实说'这个姐帮你找找看'。"
+                ), []
+            text = f"🔍 搜「{kw}」→ MCP 库存服务返回：\n\n{items_text}"
+            text += (
+                "\n⚠️ 重要：客户没主动问价格就不要报价格！只介绍品种、品质、适合谁。"
+                "\n如果客户问了多少钱，再用上面的实际单价来报。"
+                "\n只推荐珠子（品种+尺码），不要推荐成品款式（全珠链/吊坠/耳钉等）。"
+            )
+            return text, []
+        except Exception as e:
+            app_logger.warning("MCP 库存调用失败，降级到直连: %s", e)
+    # 降级：MCP 不可用时直连 inventory
     items = inventory.search(kw)
     if not items:
         return (
@@ -433,6 +524,10 @@ async def _agentic_reply(req: ReplyRequest) -> tuple[str, list[str]]:
     LLM 可以根据问题类型只查知识库（知识类问题），或者先查知识库再查库存（推荐类问题），
     甚至可以换关键词多次检索——所有决策由 LLM 在 ReAct 循环里完成。
     """
+    trace_id = uuid.uuid4().hex[:12]
+    trace_steps: list[dict] = []
+    t_start = _time_module.perf_counter()
+
     # ---- 初始消息：客户画像 + 语义记忆 ----
     user_msg = f"客户问题：{req.question}"
 
@@ -486,6 +581,11 @@ async def _agentic_reply(req: ReplyRequest) -> tuple[str, list[str]]:
         action = _parse_action(resp)
 
         if action is None:
+            # 记录最终轮 — LLM 决定直接回复，不调工具
+            trace_steps.append({
+                "round": turn + 1, "decision": "reply",
+                "response_preview": resp[:120],
+            })
             # ---- 自检轮：Agent 审核自己的回复 ----
             messages.append({"role": "assistant", "content": resp})
             messages.append({"role": "user", "content": (
@@ -508,6 +608,17 @@ async def _agentic_reply(req: ReplyRequest) -> tuple[str, list[str]]:
                 self_check=tool_used,
                 attribution_hallucination=bool(verif["hallucinated"]),
             )
+            # 持久化 Agent Trace
+            _save_trace({
+                "trace_id": trace_id,
+                "question": req.question,
+                "pre_retrieval_docs": len(kb_docs) if kb_docs else 0,
+                "pre_inventory_items": len(inv_items),
+                "steps": trace_steps,
+                "self_check": {"triggered": tool_used, "hallucinated_refs": verif["hallucinated"]},
+                "total_rounds": turn + 1,
+                "latency_ms": round((_time_module.perf_counter() - t_start) * 1000, 1),
+            })
             return _strip_meta_lines(checked, all_docs), all_docs
 
         # 执行 LLM 请求的工具（主要是 check_inventory）
@@ -516,6 +627,15 @@ async def _agentic_reply(req: ReplyRequest) -> tuple[str, list[str]]:
         tool_args = action.get("args", {})
         obs, docs = await _execute_tool(tool_name, tool_args)
         all_docs.extend(docs)
+
+        # 记录 ReAct 工具调用 trace
+        trace_steps.append({
+            "round": turn + 1,
+            "decision": "tool_call",
+            "tool": tool_name,
+            "args": tool_args,
+            "observation_len": len(obs),
+        })
 
         if tool_name == "search_knowledge" and "暂无匹配" in obs:
             had_low_conf = True
@@ -537,6 +657,17 @@ async def _agentic_reply(req: ReplyRequest) -> tuple[str, list[str]]:
     if _parse_action(final) is not None or final.strip().startswith("{"):
         messages.append({"role": "user", "content": "不要输出 JSON！用纯文本口语直接回复客户。"})
         final = _call_llm_chat(messages)
+    _save_trace({
+        "trace_id": trace_id,
+        "question": req.question,
+        "pre_retrieval_docs": len(kb_docs) if kb_docs else 0,
+        "pre_inventory_items": len(inv_items),
+        "steps": trace_steps,
+        "self_check": {"triggered": False, "hallucinated_refs": []},
+        "total_rounds": 3,
+        "force_reply": True,
+        "latency_ms": round((_time_module.perf_counter() - t_start) * 1000, 1),
+    })
     if final.strip().startswith("{"):
         return "抱歉，我这边信息有点多，让我整理一下再回复您～", all_docs
     return _strip_meta_lines(final, all_docs), all_docs
@@ -811,6 +942,9 @@ async def api_reply_stream(req: ReplyRequest):
 
 
     async def event_stream():
+        trace_id = uuid.uuid4().hex[:12]
+        trace_steps: list[dict] = []
+        t_start = _time_module.perf_counter()
         try:
             # ---- 构建初始消息（客户画像 + 语义记忆） ----
             user_msg = f"客户问题：{req.question}"
@@ -869,6 +1003,10 @@ async def api_reply_stream(req: ReplyRequest):
                 action = _parse_action(resp)
 
                 if action is None:
+                    trace_steps.append({
+                        "round": turn + 1, "decision": "reply",
+                        "response_preview": resp[:120],
+                    })
                     # ---- 自检轮：Agent 审核自己的回复 ----
                     yield _sse({"status": "checking"})
                     messages.append({"role": "assistant", "content": resp})
@@ -892,14 +1030,22 @@ async def api_reply_stream(req: ReplyRequest):
                     for i in range(0, len(final_reply), 3):
                         yield _sse({"token": final_reply[i:i+3]})
                         await asyncio.sleep(0.02)
-                    _verify_attribution(final_reply, all_docs)
+                    verif = _verify_attribution(final_reply, all_docs)
                     _agentic_metrics.record_reply(
                         short_circuit=had_low_conf,
                         self_check=tool_used,
-                        attribution_hallucination=bool(
-                            _verify_attribution(final_reply, all_docs)["hallucinated"]
-                        ),
+                        attribution_hallucination=bool(verif["hallucinated"]),
                     )
+                    _save_trace({
+                        "trace_id": trace_id,
+                        "question": req.question,
+                        "pre_retrieval_docs": len(kb_docs) if kb_docs else 0,
+                        "pre_inventory_items": len(inv_items),
+                        "steps": trace_steps,
+                        "self_check": {"triggered": tool_used, "hallucinated_refs": verif["hallucinated"]},
+                        "total_rounds": turn + 1,
+                        "latency_ms": round((_time_module.perf_counter() - t_start) * 1000, 1),
+                    })
                     yield _sse({"done": True, "full_reply": final_reply})
                     return
 
@@ -911,6 +1057,14 @@ async def api_reply_stream(req: ReplyRequest):
 
                 obs, docs = await _execute_tool(tool_name, tool_args)
                 all_docs.extend(docs)
+
+                trace_steps.append({
+                    "round": turn + 1,
+                    "decision": "tool_call",
+                    "tool": tool_name,
+                    "args": tool_args,
+                    "observation_len": len(obs),
+                })
 
                 if tool_name == "search_knowledge" and "暂无匹配" in obs:
                     had_low_conf = True
@@ -949,6 +1103,17 @@ async def api_reply_stream(req: ReplyRequest):
 
             # 兜底路径也过滤推销话术
             final_reply = _strip_meta_lines(final_reply, all_docs)
+            _save_trace({
+                "trace_id": trace_id,
+                "question": req.question,
+                "pre_retrieval_docs": len(kb_docs) if kb_docs else 0,
+                "pre_inventory_items": len(inv_items),
+                "steps": trace_steps,
+                "self_check": {"triggered": False, "hallucinated_refs": []},
+                "total_rounds": 3,
+                "force_reply": True,
+                "latency_ms": round((_time_module.perf_counter() - t_start) * 1000, 1),
+            })
             yield _sse({"done": True, "full_reply": final_reply})
 
         except RuntimeError as e:

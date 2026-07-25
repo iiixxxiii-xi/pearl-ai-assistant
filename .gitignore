@@ -18,6 +18,7 @@ conversation_memory.json
 
 # 检索日志（含客户查询内容，不能提交）
 retrieval_log.jsonl
+agent_trace.jsonl
 
 # IDE
 .vscode/

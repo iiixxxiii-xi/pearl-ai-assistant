@@ -370,6 +370,8 @@ _DOMAIN_PATTERNS: list[tuple[str, str]] = [
     (r"(海水|淡水|Akoya|akoya|大溪地|南洋金珠|马贝|爱迪生|巴洛克|keshi)", "材质"),
     (r"(圆脸|长脸|方脸|瓜子脸|鹅蛋脸|国字脸|显脸|脸型|脸大)", "脸型"),
     (r"(送妈妈|送长辈|送女友|送闺蜜|送婆婆|送岳母|买给妈妈|给妈妈|送人|生日|结婚|婚礼|礼物|本命年)", "用途"),
+    # 预算扩展标签（_expand_budget_range 生成的关键词）
+    (r"(200-300|500左右|1000左右|1000-2000|2000-3000|3000-5000|5000-10000)", "预算"),
     (r"(日常|上班|通勤|百搭|配衣服|正式|职场|休闲)", "场景"),
     (r"(7-8mm|8-9mm|9-10mm|10mm|12mm|小米珠|小尺寸|大尺寸|点位|直径)", "尺寸"),
     (r"(正圆|近圆|水滴|馒头|椭圆|异形|螺纹)", "形状"),
@@ -390,27 +392,42 @@ def _extract_query_categories(query: str) -> set[str]:
 
 
 def _keyword_aware_rerank(query: str, doc_ids: list[str]) -> list[str]:
-    """领域关键词加权重排：query 命中的类别，doc 只要匹配该类别任一模式就加分。
+    """领域关键词加权重排：类别匹配 + 精确标签匹配双层加分。
 
-    核心改进：不再要求 exact keyword match。
-    query "送人" → 类别"用途" → doc "送长辈婆婆岳母" 含"送长辈" → 命中"用途"类 → 加分。
-    具体送谁（妈妈/婆婆/女友）由文本框的输入去精准匹配。
+    第一层（类别级）：query "送人" → 类别"用途" → doc "送长辈婆婆岳母" 含"送长辈" → +1
+    第二层（精确级）：query 含扩展标签"2000-3000" → doc 含"2000-3000" → 额外 +2
+
+    精确级加分确保预算/年龄范围精准命中时优先于同类但范围不同的文档。
+    比如 query 预算 2500 → 扩展为"2000-3000" → doc 含"2000-3000"的排名高于"1000左右"。
     """
     query_categories = _extract_query_categories(query)
     if not query_categories or len(doc_ids) <= 3:
-        return doc_ids  # 没有领域关键词，不干预
+        return doc_ids
+
+    # 提取 query 中的精确标签（预算范围/年龄段等数字关键词）
+    exact_tags: set[str] = set()
+    for pattern, _category in _DOMAIN_PATTERNS:
+        for m in re.finditer(pattern, query):
+            tag = m.group(0)
+            if len(tag) >= 3:  # 过滤太短的匹配
+                exact_tags.add(tag)
 
     boost: dict[str, int] = {}
     for doc_id in doc_ids:
         doc_text = _id_to_doc.get(doc_id, "")
         score = 0
+        # 类别级 +1
         for pattern, category in _DOMAIN_PATTERNS:
             if category in query_categories and re.search(pattern, doc_text):
                 score += 1
+        # 精确标签级 +2（预算范围/年龄段等数字标签）
+        for tag in exact_tags:
+            if tag in doc_text:
+                score += 2
         boost[doc_id] = score
 
     retrieval_logger.info(
-        "关键词预过滤 — query 命中类别: %s", query_categories,
+        "关键词预过滤 — query 命中类别: %s, 精确标签: %s", query_categories, exact_tags,
     )
     for doc_id in doc_ids[:8]:
         doc_text = _id_to_doc.get(doc_id, "")[:80]
