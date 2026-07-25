@@ -19,6 +19,7 @@ load_dotenv()
 
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
+LLM_MODEL = os.getenv("LLM_MODEL", "deepseek-v4-flash")
 
 from openai import OpenAI
 
@@ -293,7 +294,7 @@ def _verify_attribution(reply: str, docs: list[str]) -> dict:
 def _call_llm(system: str, user: str, temperature: float = 0.7, max_tokens: int = 2048) -> str:
     """调用 DeepSeek，返回纯文本"""
     resp = _llm_client.chat.completions.create(
-        model="deepseek-v4-flash",
+        model=LLM_MODEL,
         messages=[
             {"role": "system", "content": system},
             {"role": "user", "content": user},
@@ -308,7 +309,7 @@ def _call_llm_chat(messages: list[dict], temperature: float = 0.7, max_tokens: i
     """调用 DeepSeek（多轮对话），返回纯文本"""
     try:
         resp = _llm_client.chat.completions.create(
-            model="deepseek-v4-flash",
+            model=LLM_MODEL,
             messages=messages,
             temperature=temperature,
             max_tokens=max_tokens,
@@ -884,7 +885,7 @@ def _run_llm_stream(messages: list[dict], temperature: float,
     队列中放入 ("token", str) 或 ("done", None) 或 ("error", str)。"""
     try:
         resp = _llm_client.chat.completions.create(
-            model="deepseek-v4-flash",
+            model=LLM_MODEL,
             messages=messages,
             temperature=temperature,
             max_tokens=max_tokens,
@@ -1152,7 +1153,7 @@ async def api_content(req: ContentRequest):
         user_msg = f"请写一篇关于「{req.topic}」的小红书笔记。\n\n以下是珍珠知识库中相关内容，请以此为素材：\n\n{knowledge_text}"
 
         resp = _llm_client.chat.completions.create(
-            model="deepseek-v4-flash",
+            model=LLM_MODEL,
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT_CONTENT},
                 {"role": "user", "content": user_msg},
