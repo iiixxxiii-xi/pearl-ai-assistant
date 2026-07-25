@@ -503,3 +503,101 @@ def test_extract_kb_keywords_seawater_freshwater():
     keywords = _extract_kb_keywords(docs)
     assert "海水珍珠" in keywords
     assert "淡水珍珠" in keywords
+
+
+# ============================================================
+# Redis 降级测试 — Redis 不可用时自动回退内存字典
+# ============================================================
+def test_cache_fallback_when_redis_down(monkeypatch):
+    """Redis 不可用时自动降级内存字典，读写正常不抛异常"""
+    import cache
+
+    # 强制 _try_connect_redis 返回 None，模拟 Redis 挂了
+    monkeypatch.setattr(cache, "_try_connect_redis", lambda: None)
+    # 重置 Redis 客户端缓存（避免之前成功的连接被复用）
+    monkeypatch.setattr(cache, "_redis_client", None)
+
+    # 写入
+    cache.cache.set("test_fb_key", "test_fb_value", ttl=60)
+    # 读取
+    result = cache.cache.get("test_fb_key")
+    assert result == "test_fb_value", f"降级到内存后应能正常读写，实际: {result}"
+
+
+def test_cache_fallback_ttl_expires(monkeypatch):
+    """内存降级时 TTL 过期后返回 None"""
+    import cache
+    import time
+
+    monkeypatch.setattr(cache, "_try_connect_redis", lambda: None)
+    monkeypatch.setattr(cache, "_redis_client", None)
+
+    # 用已过期的 TTL 写入
+    cache.cache.set("test_exp_key", "test_exp_value", ttl=-1)
+
+    # 过期后读取应返回 None
+    result = cache.cache.get("test_exp_key")
+    assert result is None, f"TTL 过期应返回 None，实际: {result}"
+
+
+# ============================================================
+# 库存原子写入测试 — 写入中断时旧数据完整
+# ============================================================
+def test_inventory_atomic_write_doesnt_lose_data(tmp_path, monkeypatch):
+    """原子写入崩溃场景：临时文件存在但未替换，旧数据完整"""
+    import inventory
+    import json
+
+    # 在 tmp_path 下创建假的 inventory.json
+    inv_file = tmp_path / "inventory.json"
+    original_data = [
+        {"name": "测试珠子", "stock": 10, "price_per_piece": 100, "type": "淡水", "grade": "测试"}
+    ]
+    inv_file.write_text(json.dumps(original_data, ensure_ascii=False), encoding="utf-8")
+
+    monkeypatch.setattr(inventory, "INVENTORY_FILE", inv_file)
+
+    # 模拟崩溃：写完 tmp 文件后，replace 还没来得及执行就挂了
+    # → tmp 文件存在，但 .json 文件还是旧的
+    tmp_file = inv_file.with_suffix(".tmp")
+    tmp_file.write_text(
+        json.dumps([{"name": "坏数据", "stock": 0}], ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    # _load 应该只读 .json 文件，不碰 .tmp
+    loaded = inventory._load()
+    assert loaded == original_data, (
+        f"即使有残留 tmp 文件，也应读取完整旧数据。期望: {original_data}, 实际: {loaded}"
+    )
+
+    # 清理
+    tmp_file.unlink()
+
+
+def test_inventory_atomic_write_normal_flow(tmp_path, monkeypatch):
+    """正常写入：_save 后 _load 读到新数据"""
+    import inventory
+    import json
+
+    inv_file = tmp_path / "inventory.json"
+    original_data = [
+        {"name": "旧珠子", "stock": 5, "price_per_piece": 50, "type": "淡水", "grade": ""}
+    ]
+    inv_file.write_text(json.dumps(original_data, ensure_ascii=False), encoding="utf-8")
+
+    monkeypatch.setattr(inventory, "INVENTORY_FILE", inv_file)
+
+    # 正常保存新数据
+    new_data = [
+        {"name": "新珠子", "stock": 20, "price_per_piece": 200, "type": "海水", "grade": "AAA"}
+    ]
+    inventory._save(new_data)
+
+    # 读取验证
+    loaded = inventory._load()
+    assert loaded == new_data, f"正常写入后应读到新数据。期望: {new_data}, 实际: {loaded}"
+
+    # 确认 tmp 文件已被 replace 清理（不存在）
+    tmp_file = inv_file.with_suffix(".tmp")
+    assert not tmp_file.exists(), "正常写入后 tmp 文件应不存在"

@@ -260,30 +260,74 @@ def _call_llm_chat(messages: list[dict], temperature: float = 0.7, max_tokens: i
 #
 # 面试话术：
 # "Agent 部分没用 LangGraph，自己写了 ReAct 循环。
-#  LLM 面对 2 个工具有三种选择：直接用初步检索结果、
-#  换角度再搜知识库、查库存——不是 if-else，是真正的决策。
+#  工具做了注册制——TOOLS 字典统一管理，加新工具只需加一行配置，
+#  不改 _react_system_prompt 和 _execute_tool。
 #  生成后加了一轮自检：编造检查、预算检查、款式检查，
 #  相当于 Agent 自己审核自己。纠错比人快。"
 # ============================================================
 
-_TOOLS: dict[str, dict] = {
+# ============================================================
+# 工具注册表 — 加新工具只需在这里加一行
+# Agent 循环逻辑与工具定义解耦，不改 _react_system_prompt / _execute_tool
+# ============================================================
+
+async def _handle_search_knowledge(args: dict) -> tuple[str, list[str]]:
+    """搜索珍珠知识库"""
+    query = args.get("query", "")
+    docs, conf = await rag.hybrid_search(query)
+    if conf < rag.SIMILARITY_FLOOR:
+        return "⚠️ 知识库中暂无高度匹配的内容。请在回复中诚实告知客户，不要编造。", []
+    return "\n\n".join(
+        f"[知识条目{i + 1}]\n{d}" for i, d in enumerate(docs)
+    ), docs
+
+
+async def _handle_check_inventory(args: dict) -> tuple[str, list[str]]:
+    """查询库存"""
+    kw = args.get("keyword", "")
+    items = inventory.search(kw)
+    if not items:
+        return (
+            f"⚠️ 库存中没有找到「{kw}」。不要自己编产品名和价格！"
+            "请用更短更宽泛的关键词（比如只搜品种名'Akoya'，去掉尺码和款式词），"
+            "调用 check_inventory 再查一次。如果两次都查不到，就诚实告诉客户'这个姐帮你找找看'。"
+        ), []
+    text = inventory.format_inventory_for_prompt(items)
+    text = f"🔍 搜「{kw}」→ 匹配到以下库存（只有这些，没有其他）：\n\n{text}"
+    text += (
+        "\n⚠️ 重要：客户没主动问价格就不要报价格！只介绍品种、品质、适合谁。"
+        "\n如果客户问了多少钱，再用上面的实际单价来报。"
+        "\n只推荐珠子（品种+尺码），不要推荐成品款式（全珠链/吊坠/耳钉等）。"
+        "\n⚠️ 上面列出的就是所有有货的库存。客户问的精确尺寸没匹配到时，推荐最接近的尺寸，不要说'没货'——你看到的列表就是有货的。"
+    )
+    return text, []
+
+
+TOOLS: dict[str, dict] = {
     "search_knowledge": {
-        "desc": "搜索珍珠知识库。当初步检索结果不够、或需要从不同角度补充信息时调用。",
-        "params": {"query": "换个角度的搜索词，如初步搜了'圆脸珍珠'但不够→搜'圆脸显脸小搭配'"},
+        "description": "搜索珍珠知识库，获取专业知识",
+        "parameters": {"query": "搜索关键词"},
+        "handler": _handle_search_knowledge,
     },
     "check_inventory": {
-        "desc": "查看珍珠库存（种类、价格、尺码、数量）。客户有购买意向时调用。",
-        "params": {"keyword": "关键词，如'Akoya'、'淡水'、'7-8mm'"},
+        "description": "查询库存，获取珠子品种、规格、价格、数量",
+        "parameters": {"keyword": "珠子品种或关键词"},
+        "handler": _handle_check_inventory,
     },
 }
 
 
 def _react_system_prompt(user_type: str) -> str:
-    """构建包含工具清单的 System Prompt"""
+    """构建包含工具清单的 System Prompt（从 TOOLS 注册表动态生成）"""
     base = SYSTEM_PROMPT_REPLY if user_type == "mom" else SYSTEM_PROMPT_REPLY_SISTER
     tools_desc = "\n".join(
-        f"  • {name} — {info['desc']}  参数：{json.dumps(info['params'], ensure_ascii=False)}"
-        for name, info in _TOOLS.items()
+        f"  • {name} — {info['description']}  参数：{json.dumps(info['parameters'], ensure_ascii=False)}"
+        for name, info in TOOLS.items()
+    )
+    # 动态生成 JSON 示例
+    examples = "\n".join(
+        f'{{{{"tool":"{name}","args":{json.dumps(info["parameters"], ensure_ascii=False)}}}}}'
+        for name, info in TOOLS.items()
     )
     return f"""{base}
 
@@ -296,8 +340,7 @@ def _react_system_prompt(user_type: str) -> str:
 - 客户有购买意向 → 调用 check_inventory 查库存
 - 信息足够后直接输出纯文本回复
 - 调工具时只输出一行 JSON，如：
-{{"tool":"search_knowledge","args":{{"query":"换角度搜索词"}}}}
-{{"tool":"check_inventory","args":{{"keyword":"品种名"}}}}
+{examples}
 
 【生成后自检 — 最高优先级】
 回复客户前，在脑中逐条检查：
@@ -352,36 +395,14 @@ def _parse_action(text: str) -> dict | None:
 
 
 async def _execute_tool(name: str, args: dict) -> tuple[str, list[str]]:
-    """执行工具，返回 (LLM 可读的格式化结果, 知识库文档列表用于归因验证)"""
-    if name == "search_knowledge":
-        query = args.get("query", "")
-        docs, conf = await rag.hybrid_search(query)
-        if conf < rag.SIMILARITY_FLOOR:
-            return "⚠️ 知识库中暂无高度匹配的内容。请在回复中诚实告知客户，不要编造。", []
-        return "\n\n".join(
-            f"[知识条目{i + 1}]\n{d}" for i, d in enumerate(docs)
-        ), docs
-
-    if name == "check_inventory":
-        kw = args.get("keyword", "")
-        items = inventory.search(kw)
-        if not items:
-            return (
-                f"⚠️ 库存中没有找到「{kw}」。不要自己编产品名和价格！"
-                "请用更短更宽泛的关键词（比如只搜品种名'Akoya'，去掉尺码和款式词），"
-                "调用 check_inventory 再查一次。如果两次都查不到，就诚实告诉客户'这个姐帮你找找看'。"
-            ), []
-        text = inventory.format_inventory_for_prompt(items)
-        text = f"🔍 搜「{kw}」→ 匹配到以下库存（只有这些，没有其他）：\n\n{text}"
-        text += (
-            "\n⚠️ 重要：客户没主动问价格就不要报价格！只介绍品种、品质、适合谁。"
-            "\n如果客户问了多少钱，再用上面的实际单价来报。"
-            "\n只推荐珠子（品种+尺码），不要推荐成品款式（全珠链/吊坠/耳钉等）。"
-            "\n⚠️ 上面列出的就是所有有货的库存。客户问的精确尺寸没匹配到时，推荐最接近的尺寸，不要说'没货'——你看到的列表就是有货的。"
-        )
-        return text, []
-
-    return f"未知工具「{name}」。可用：search_knowledge, check_inventory", []
+    """执行工具 — 从 TOOLS 注册表查找 handler，不硬编码 if-else 路由。
+    返回 (LLM 可读的格式化结果, 知识库文档列表用于归因验证)。
+    """
+    tool = TOOLS.get(name)
+    if tool is None:
+        available = ", ".join(TOOLS.keys())
+        return f"未知工具「{name}」。可用：{available}", []
+    return await tool["handler"](args)
 
 
 async def _agentic_reply(req: ReplyRequest) -> tuple[str, list[str]]:
