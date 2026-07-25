@@ -584,9 +584,9 @@
               '<span style="font-size:12px;color:#9b8b78;">' + (item.type||'') + ' · ¥' + (item.price_per_piece||item.price||'?') + '/颗</span></div>' +
             '<div style="text-align:right;min-width:100px;">' +
               '<span' + low + '>库存：' + item.stock + '</span>' + soldOut + '<br>' +
-              '<button onclick="stockIn(\'' + item.name.replace(/'/g,"\\'") + '\')" style="font-size:11px;padding:2px 8px;margin-right:4px;border:1px solid #27ae60;border-radius:4px;background:#fff;color:#27ae60;cursor:pointer;">+1</button>' +
-              '<button onclick="stockOut(\'' + item.name.replace(/'/g,"\\'") + '\')" style="font-size:11px;padding:2px 8px;margin-right:4px;border:1px solid #c0392b;border-radius:4px;background:#fff;color:#c0392b;cursor:pointer;">-1</button>' +
-              '<button onclick="deletePearl(\'' + item.name.replace(/'/g,"\\'") + '\')" style="font-size:11px;padding:2px 6px;border:1px solid #e67e22;border-radius:4px;background:#fff;color:#e67e22;cursor:pointer;">🗑</button>' +
+              '<button onclick="stockIn(\'' + item.name.replace(/'/g,"\\'") + '\')" style="font-size:11px;padding:2px 8px;margin-right:4px;border:1px solid #27ae60;border-radius:4px;background:#fff;color:#27ae60;cursor:pointer;">+入库</button>' +
+              '<button onclick="stockOut(\'' + item.name.replace(/'/g,"\\'") + '\')" style="font-size:11px;padding:2px 8px;margin-right:4px;border:1px solid #c0392b;border-radius:4px;background:#fff;color:#c0392b;cursor:pointer;">-出库</button>' +
+              '<button onclick="deletePearl(\'' + item.name.replace(/'/g,"\\'") + '\')" style="font-size:11px;padding:2px 6px;border:1px solid #e67e22;border-radius:4px;background:#fff;color:#e67e22;cursor:pointer;">删除</button>' +
             '</div></div>';
         });
         list.innerHTML = html;
