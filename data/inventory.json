@@ -1,0 +1,107 @@
+[
+  {
+    "name": "淡水珍珠 5-6mm",
+    "type": "淡水珍珠",
+    "price_per_piece": 120,
+    "stock": 3,
+    "grade": "近圆，强光，白色/粉色，小点位"
+  },
+  {
+    "name": "淡水珍珠 7-8mm",
+    "type": "淡水珍珠",
+    "price_per_piece": 250,
+    "stock": 25,
+    "grade": "近圆，强光，白色/粉色，最常用尺寸"
+  },
+  {
+    "name": "淡水珍珠 9-10mm",
+    "type": "淡水珍珠",
+    "price_per_piece": 500,
+    "stock": 15,
+    "grade": "正圆，极强光，白色，直径大显贵气"
+  },
+  {
+    "name": "淡水珍珠 10-12mm",
+    "type": "淡水珍珠",
+    "price_per_piece": 600,
+    "stock": 8,
+    "grade": "正圆/近圆，强光，大点位，适合单珠吊坠"
+  },
+  {
+    "name": "Akoya珍珠 6-7mm",
+    "type": "Akoya珍珠",
+    "price_per_piece": 600,
+    "stock": 12,
+    "grade": "正圆，极强光，花珠级别，日本产"
+  },
+  {
+    "name": "Akoya珍珠 7-8mm",
+    "type": "Akoya珍珠",
+    "price_per_piece": 800,
+    "stock": 10,
+    "grade": "正圆，极强光，花珠级别，日本产，小灯泡光泽"
+  },
+  {
+    "name": "Akoya珍珠 8-8.5mm",
+    "type": "Akoya珍珠",
+    "price_per_piece": 1300,
+    "stock": 6,
+    "grade": "正圆，天女级别光泽，日本产"
+  },
+  {
+    "name": "大溪地黑珍珠 8-9mm",
+    "type": "大溪地珍珠",
+    "price_per_piece": 1800,
+    "stock": 8,
+    "grade": "正圆，孔雀绿/深灰，极强光，法属波利尼西亚产"
+  },
+  {
+    "name": "大溪地黑珍珠 10-11mm",
+    "type": "大溪地珍珠",
+    "price_per_piece": 2800,
+    "stock": 5,
+    "grade": "正圆，孔雀绿，极强光，大点位"
+  },
+  {
+    "name": "南洋金珠 9-10mm",
+    "type": "南洋金珠",
+    "price_per_piece": 2200,
+    "stock": 6,
+    "grade": "正圆，中金色，极强光，南洋产地"
+  },
+  {
+    "name": "南洋金珠 11-12mm",
+    "type": "南洋金珠",
+    "price_per_piece": 4000,
+    "stock": 3,
+    "grade": "正圆，浓金色，极强光，镇店级"
+  },
+  {
+    "name": "马贝珠 10-12mm",
+    "type": "马贝珠",
+    "price_per_piece": 300,
+    "stock": 15,
+    "grade": "半圆形，彩虹光晕，单珠用"
+  },
+  {
+    "name": "大溪地珍珠 7-8mm",
+    "stock": 4,
+    "price_per_piece": 2000,
+    "type": "大溪地",
+    "grade": "正圆"
+  },
+  {
+    "name": "澳白珍珠10-11mm",
+    "stock": 5,
+    "price_per_piece": 2500,
+    "type": "澳白",
+    "grade": "微瑕正圆极强光冷白光"
+  },
+  {
+    "name": "金珠10-11",
+    "stock": 4,
+    "price_per_piece": 3100,
+    "type": "金珠",
+    "grade": "微瑕正圆"
+  }
+]

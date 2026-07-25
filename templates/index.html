@@ -1,0 +1,671 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+  <title>珍珠 AI 助手</title>
+  <style>
+    /* ====== 全局 ====== */
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #fdfaf5;
+      color: #3d3226;
+      min-height: 100vh;
+      -webkit-tap-highlight-color: transparent;
+    }
+
+    /* ====== 顶部 ====== */
+    .header {
+      background: linear-gradient(135deg, #f5ede0 0%, #ebe1d1 100%);
+      padding: 16px 20px;
+      text-align: center;
+      border-bottom: 1px solid #e0d5c5;
+    }
+    .header h1 { font-size: 20px; font-weight: 600; color: #5c4a35; }
+    .header p { font-size: 12px; color: #9b8b78; margin-top: 4px; }
+
+    /* ====== Tab 切换 ====== */
+    .tabs {
+      display: flex;
+      margin: 16px 16px 0;
+      background: #f0e8da;
+      border-radius: 12px;
+      padding: 4px;
+    }
+    .tab {
+      flex: 1;
+      text-align: center;
+      padding: 10px;
+      font-size: 15px;
+      font-weight: 500;
+      border-radius: 10px;
+      cursor: pointer;
+      transition: all 0.2s;
+      color: #8b7a65;
+      user-select: none;
+    }
+    .tab.active {
+      background: #fff;
+      color: #5c4a35;
+      box-shadow: 0 1px 4px rgba(0,0,0,0.06);
+    }
+
+    /* ====== 主内容区 ====== */
+    .content { padding: 16px; max-width: 500px; margin: 0 auto; }
+    .panel { display: none; }
+    .panel.active { display: block; }
+
+    /* ====== 输入区 ====== */
+    .input-group { margin-bottom: 14px; }
+    .input-group label {
+      display: block;
+      font-size: 14px;
+      font-weight: 500;
+      margin-bottom: 6px;
+      color: #6b5d4b;
+    }
+    .input-group textarea,
+    .input-group input {
+      width: 100%;
+      padding: 12px 14px;
+      font-size: 15px;
+      border: 1.5px solid #e0d5c5;
+      border-radius: 10px;
+      background: #fff;
+      color: #3d3226;
+      outline: none;
+      transition: border-color 0.2s;
+      font-family: inherit;
+      resize: vertical;
+    }
+    .input-group textarea:focus,
+    .input-group input:focus,
+    .input-group select:focus { border-color: #c4a882; }
+    .input-group textarea { min-height: 80px; }
+    .input-group select {
+      width: 100%;
+      padding: 12px 14px;
+      font-size: 15px;
+      border: 1.5px solid #e0d5c5;
+      border-radius: 10px;
+      background: #fff;
+      color: #3d3226;
+      outline: none;
+      transition: border-color 0.2s;
+      font-family: inherit;
+      appearance: none;
+      -webkit-appearance: none;
+      background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8'%3E%3Cpath d='M1 1l5 5 5-5' stroke='%238b7a65' stroke-width='1.5' fill='none'/%3E%3C/svg%3E");
+      background-repeat: no-repeat;
+      background-position: right 14px center;
+      background-size: 12px;
+      padding-right: 36px;
+    }
+    .hint { font-size: 12px; color: #b5a58c; margin-top: 4px; }
+
+    /* ====== 按钮 ====== */
+    .btn {
+      width: 100%;
+      padding: 13px;
+      font-size: 16px;
+      font-weight: 600;
+      border: none;
+      border-radius: 10px;
+      cursor: pointer;
+      transition: all 0.2s;
+      font-family: inherit;
+    }
+    .btn-primary {
+      background: #5c4a35;
+      color: #fff;
+    }
+    .btn-primary:active { background: #4a3b2a; transform: scale(0.98); }
+    .btn-primary:disabled { background: #c4b8a5; cursor: not-allowed; }
+
+    .btn-group { display: flex; gap: 10px; margin-top: 10px; }
+    .btn-sm {
+      flex: 1;
+      padding: 10px;
+      font-size: 14px;
+      font-weight: 500;
+      border: 1.5px solid #d4c8b5;
+      border-radius: 8px;
+      background: #fff;
+      color: #5c4a35;
+      cursor: pointer;
+      text-align: center;
+      transition: all 0.15s;
+      font-family: inherit;
+    }
+    .btn-sm:active { background: #f5ede0; transform: scale(0.98); }
+
+    /* ====== 结果区 ====== */
+    .result {
+      margin-top: 16px;
+      padding: 16px;
+      background: #fff;
+      border-radius: 12px;
+      border: 1px solid #e8dccd;
+      min-height: 60px;
+      display: none;
+      white-space: pre-wrap;
+      word-break: break-word;
+      font-size: 15px;
+      line-height: 1.6;
+      color: #3d3226;
+    }
+    .result.show { display: block; }
+
+    .loading {
+      text-align: center;
+      color: #b5a58c;
+      padding: 30px;
+      font-size: 14px;
+    }
+    .loading::after {
+      content: '';
+      display: inline-block;
+      animation: dots 1.5s infinite;
+    }
+    @keyframes dots {
+      0%, 20% { content: ''; }
+      40% { content: '.'; }
+      60% { content: '..'; }
+      80%, 100% { content: '...'; }
+    }
+
+    .error {
+      color: #c0392b;
+      background: #fdf0ef;
+      padding: 12px;
+      border-radius: 8px;
+      font-size: 14px;
+    }
+
+    /* ====== Toast ====== */
+    .toast {
+      position: fixed;
+      bottom: 30px;
+      left: 50%;
+      transform: translateX(-50%);
+      background: #3d3226;
+      color: #fff;
+      padding: 10px 24px;
+      border-radius: 20px;
+      font-size: 14px;
+      opacity: 0;
+      transition: opacity 0.3s;
+      z-index: 100;
+      pointer-events: none;
+    }
+    .toast.show { opacity: 1; }
+
+    /* ====== 底部 ====== */
+    .footer {
+      text-align: center;
+      padding: 20px;
+      font-size: 12px;
+      color: #c4b8a5;
+    }
+  </style>
+</head>
+<body>
+
+  <!-- 顶部 -->
+  <div class="header">
+    <h1>🦪 珍珠 AI 助手</h1>
+    <p>知识库 · 客服回复 · 内容创作</p>
+  </div>
+
+  <!-- Tab -->
+  <div class="tabs">
+    <div class="tab active" onclick="switchTab('reply')">💬 客服回复</div>
+    <div class="tab" onclick="switchTab('content')">✍️ 内容生成</div>
+    <div class="tab" onclick="switchTab('inventory')">📦 库存</div>
+  </div>
+
+  <div class="content">
+
+    <!-- ========== 客服回复面板 ========== -->
+    <div id="panel-reply" class="panel active">
+      <!-- 用户切换 -->
+      <div class="input-group">
+        <label>谁在回复？</label>
+        <div style="display:flex; gap:8px;">
+          <button class="btn-sm active" id="user-mom" onclick="switchUser('mom')" style="flex:1;">👩‍🦰 妈妈</button>
+          <button class="btn-sm" id="user-sister" onclick="switchUser('sister')" style="flex:1;">👩 姐姐</button>
+        </div>
+      </div>
+      <div class="input-group">
+        <label>客户需求简述</label>
+        <textarea id="reply-question" placeholder="客户原话或总结&#10;比如：想给妈妈买生日礼物，圆脸"></textarea>
+      </div>
+      <div class="input-group">
+        <label>自己戴还是送人</label>
+        <select id="reply-usage">
+          <option value="">不选</option>
+          <option value="自己戴">自己戴</option>
+          <option value="送人">送人</option>
+        </select>
+      </div>
+      <div class="input-group">
+        <label>想要什么品质</label>
+        <select id="reply-quality">
+          <option value="">不选</option>
+          <option value="好看就行">好看就行</option>
+          <option value="品质好一点">品质好一点</option>
+          <option value="要最好的">要最好的</option>
+        </select>
+      </div>
+      <div class="input-group">
+        <label>对珍珠了解程度</label>
+        <select id="reply-knowledge">
+          <option value="">不选</option>
+          <option value="完全不懂">完全不懂</option>
+          <option value="略懂一点">略懂一点</option>
+          <option value="很懂行">很懂行</option>
+        </select>
+      </div>
+      <div class="input-group">
+        <label>客户性格（选填）</label>
+        <select id="reply-trait-select" onchange="onTraitSelectChange()">
+          <option value="">不选</option>
+          <option value="比较纠结">比较纠结</option>
+          <option value="很纠结">很纠结</option>
+          <option value="爽快果断">爽快果断</option>
+          <option value="__custom__">其他（自己写）</option>
+        </select>
+        <input id="reply-trait-custom" type="text" placeholder="自己描述客户性格…" style="display:none; margin-top:8px;">
+        <div class="hint">选填——刚开始聊可以不选，聊多了再补</div>
+      </div>
+      <button class="btn btn-primary" id="reply-btn" onclick="doReply()">生成回复</button>
+      <div id="reply-result" class="result"></div>
+      <div id="reply-actions" class="btn-group" style="display:none;">
+        <button class="btn-sm" onclick="copyResult('reply-result')">📋 复制</button>
+        <button class="btn-sm" onclick="doReply(true)">🔄 换一个</button>
+      </div>
+    </div>
+
+    <!-- ========== 内容生成面板 ========== -->
+    <div id="panel-content" class="panel">
+      <div class="input-group">
+        <label>想写什么话题？</label>
+        <textarea id="content-topic" placeholder="输入想写的话题&#10;比如：淡水珍珠和海水珍珠怎么分辨"></textarea>
+      </div>
+      <button class="btn btn-primary" id="content-btn" onclick="doContent()">生成内容</button>
+      <div id="content-result" class="result"></div>
+      <div id="content-actions" class="btn-group" style="display:none;">
+        <button class="btn-sm" onclick="copyResult('content-result')">📋 复制全文</button>
+        <button class="btn-sm" onclick="doContent(true)">🔄 换一个</button>
+      </div>
+    </div>
+
+    <!-- ========== 库存管理面板 ========== -->
+    <div id="panel-inventory" class="panel">
+      <button class="btn-sm" onclick="toggleAddForm()" style="width:100%;margin-bottom:8px;">➕ 新增珠子品种</button>
+      <div id="add-pearl-form" style="display:none;background:#fff;padding:12px;border-radius:10px;border:1px solid #e0d5c5;margin-bottom:12px;">
+        <input id="new-pearl-name" type="text" placeholder="名字（如：Akoya珍珠 7-8mm）" style="width:100%;padding:8px;margin-bottom:6px;border:1px solid #e0d5c5;border-radius:6px;font-size:14px;">
+        <input id="new-pearl-type" type="text" placeholder="类型（淡水珍珠/Akoya/大溪地...）" style="width:100%;padding:8px;margin-bottom:6px;border:1px solid #e0d5c5;border-radius:6px;font-size:14px;">
+        <div style="display:flex;gap:6px;margin-bottom:6px;">
+          <input id="new-pearl-price" type="number" placeholder="单价/颗" style="flex:1;padding:8px;border:1px solid #e0d5c5;border-radius:6px;font-size:14px;">
+          <input id="new-pearl-stock" type="number" placeholder="库存数量" style="flex:1;padding:8px;border:1px solid #e0d5c5;border-radius:6px;font-size:14px;">
+        </div>
+        <input id="new-pearl-grade" type="text" placeholder="品质描述（如：正圆，极强光，日本产）" style="width:100%;padding:8px;margin-bottom:8px;border:1px solid #e0d5c5;border-radius:6px;font-size:14px;">
+        <button class="btn btn-primary" onclick="addNewPearl()" style="font-size:14px;padding:10px;">确认添加</button>
+      </div>
+      <button class="btn-sm" onclick="loadInventory()" style="width:100%;background:#5c4a35;color:#fff;">🔄 刷新库存</button>
+      <div id="inventory-list" class="result show" style="font-size:14px;margin-top:10px;">点击刷新库存查看</div>
+    </div>
+
+  </div>
+
+  <div class="footer">珍珠 AI 助手 · 给家人的工具</div>
+  <div class="toast" id="toast"></div>
+
+  <script>
+    // ====== Tab 切换 ======
+    function switchTab(mode) {
+      const idx = mode === 'reply' ? 0 : mode === 'content' ? 1 : 2;
+      document.querySelectorAll('.tab').forEach((el, i) => {
+        el.classList.toggle('active', i === idx);
+      });
+      document.querySelectorAll('.panel').forEach(el => el.classList.remove('active'));
+      document.getElementById('panel-' + mode).classList.add('active');
+      if (mode === 'inventory') loadInventory();
+    }
+
+    // ====== Toast ======
+    let toastTimer;
+    function showToast(msg) {
+      const el = document.getElementById('toast');
+      el.textContent = msg;
+      el.classList.add('show');
+      clearTimeout(toastTimer);
+      toastTimer = setTimeout(() => el.classList.remove('show'), 1800);
+    }
+
+    // ====== 当前用户 + 会话上下文 ======
+    let currentUser = 'mom';  // 默认妈妈
+    let lastQuestion = '';
+    let lastReply = '';
+
+    function switchUser(user) {
+      currentUser = user;
+      document.getElementById('user-mom').classList.toggle('active', user === 'mom');
+      document.getElementById('user-sister').classList.toggle('active', user === 'sister');
+    }
+
+    function onTraitSelectChange() {
+      const sel = document.getElementById('reply-trait-select');
+      const custom = document.getElementById('reply-trait-custom');
+      if (sel.value === '__custom__') {
+        custom.style.display = 'block';
+        custom.focus();
+      } else {
+        custom.style.display = 'none';
+        custom.value = '';
+      }
+    }
+
+    function sendFeedback(action) {
+      fetch('/api/feedback', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: action,
+          question: lastQuestion,
+          reply: lastReply,
+        }),
+      }).catch(() => {}); // 静默发送，不影响使用
+    }
+
+    // ====== 复制 ======
+    function copyResult(resultId) {
+      const el = document.getElementById(resultId);
+      const text = el.textContent.trim();
+      if (!text) return;
+      navigator.clipboard.writeText(text).then(() => {
+        showToast('已复制 ✅');
+        sendFeedback('copied');
+      }).catch(() => {
+        const ta = document.createElement('textarea');
+        ta.value = text;
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand('copy');
+        document.body.removeChild(ta);
+        showToast('已复制 ✅');
+        sendFeedback('copied');
+      });
+    }
+
+    // ====== 客服回复（流式版 + 打字机效果） ======
+    let replyAbortController = null;  // 用于取消上一次请求
+
+    async function doReply(regenerated = false) {
+      const question = document.getElementById('reply-question').value.trim();
+      if (!question) { showToast('请先输入客户问题'); return; }
+
+      // 取消上一次还没播完的流
+      if (replyAbortController) replyAbortController.abort();
+      replyAbortController = new AbortController();
+
+      const traitSelect = document.getElementById('reply-trait-select');
+      let trait = traitSelect.value;
+      if (trait === '__custom__') {
+        trait = document.getElementById('reply-trait-custom').value.trim();
+      }
+      const usage = document.getElementById('reply-usage').value;
+      const quality = document.getElementById('reply-quality').value;
+      const knowledgeLevel = document.getElementById('reply-knowledge').value;
+      const btn = document.getElementById('reply-btn');
+      const result = document.getElementById('reply-result');
+      const actions = document.getElementById('reply-actions');
+
+      if (regenerated && lastReply) sendFeedback('regenerated');
+
+      btn.disabled = true;
+      btn.textContent = '生成中...';
+      result.className = 'result show';
+      result.textContent = '';
+      actions.style.display = 'none';
+
+      // 打字机队列：收到 token 先存入，然后逐字渲染
+      let tokenQueue = [];
+      let typing = false;
+      let currentStatus = 'searching';  // searching → generating → (refining) → done
+
+      function typeNext() {
+        if (tokenQueue.length === 0) { typing = false; return; }
+        typing = true;
+        result.textContent += tokenQueue.shift();
+        setTimeout(typeNext, 25);
+      }
+
+      try {
+        const resp = await fetch('/api/reply/stream', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ question, trait, usage, quality, knowledge_level: knowledgeLevel, user: currentUser }),
+          signal: replyAbortController.signal,
+        });
+
+        const reader = resp.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split('\n\n');
+          buffer = lines.pop();
+
+          for (const line of lines) {
+            if (!line.startsWith('data: ')) continue;
+            try {
+              const data = JSON.parse(line.slice(6));
+
+              if (data.status === 'thinking') {
+                currentStatus = 'thinking';
+                result.textContent = '🤔 正在分析问题...';
+              }
+
+              if (data.status === 'searching') {
+                currentStatus = 'searching';
+                const toolName = data.tool === 'check_inventory' ? '库存' : '知识库';
+                result.textContent = `🔍 正在查询${toolName}...`;
+              }
+
+              if (data.status === 'generating') {
+                currentStatus = 'generating';
+                result.textContent = '';
+                tokenQueue = [];
+                typing = false;
+              }
+
+              if (data.token) {
+                tokenQueue.push(data.token);
+                if (!typing) typeNext();
+              }
+
+              if (data.done) {
+                lastQuestion = question;
+                lastReply = data.full_reply;
+                const checkTypingDone = setInterval(() => {
+                  if (!typing && tokenQueue.length === 0) {
+                    actions.style.display = 'flex';
+                    clearInterval(checkTypingDone);
+                  }
+                }, 100);
+              }
+
+              if (data.error) {
+                result.className = 'result show error';
+                result.textContent = '出错了：' + data.error;
+              }
+            } catch (e) {}
+          }
+        }
+      } catch (err) {
+        if (err.name === 'AbortError') return;  // 被取消，不报错
+        result.className = 'result show error';
+        result.textContent = '网络出问题了，检查一下服务是不是在运行';
+        actions.style.display = 'none';
+      } finally {
+        btn.disabled = false;
+        btn.textContent = '生成回复';
+      }
+    }
+
+    // ====== 内容生成 ======
+    async function doContent(regenerated = false) {
+      const topic = document.getElementById('content-topic').value.trim();
+      if (!topic) { showToast('请先输入话题'); return; }
+
+      const btn = document.getElementById('content-btn');
+      const result = document.getElementById('content-result');
+      const actions = document.getElementById('content-actions');
+
+      if (regenerated && lastReply) sendFeedback('regenerated');
+
+      btn.disabled = true;
+      btn.textContent = '生成中...';
+      result.className = 'result show loading';
+      result.textContent = 'AI 正在写内容';
+      actions.style.display = 'none';
+
+      try {
+        const resp = await fetch('/api/content', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ topic }),
+        });
+        const data = await resp.json();
+        if (resp.ok) {
+          result.className = 'result show';
+          result.textContent = data.content;
+          lastQuestion = topic;
+          lastReply = data.content;
+          actions.style.display = 'flex';
+        } else {
+          result.className = 'result show error';
+          result.textContent = '出错了：' + (data.error || '未知错误');
+          actions.style.display = 'none';
+        }
+      } catch (err) {
+        result.className = 'result show error';
+        result.textContent = '网络出问题了，检查一下服务是不是在运行';
+        actions.style.display = 'none';
+      } finally {
+        btn.disabled = false;
+        btn.textContent = '生成内容';
+      }
+    }
+
+    // ====== 库存管理 ======
+    async function loadInventory() {
+      const list = document.getElementById('inventory-list');
+      list.innerHTML = '<div class="loading">加载中</div>';
+      try {
+        const resp = await fetch('/api/inventory');
+        const data = await resp.json();
+        if (!resp.ok) { list.innerHTML = '<div class="error">' + (data.error || '加载失败') + '</div>'; return; }
+        if (data.items.length === 0) { list.innerHTML = '还没有库存数据'; return; }
+
+        let html = '<div style="font-size:12px;color:#9b8b78;margin-bottom:8px;">共 ' + data.count + ' 款</div>';
+        data.items.forEach((item, i) => {
+          const low = item.stock <= 3 ? ' style="color:#c0392b;font-weight:600;"' : '';
+          const soldOut = item.stock === 0 ? ' （售罄）' : '';
+          html += '<div style="display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px solid #f0e8da;">' +
+            '<div style="flex:1;"><strong>' + item.name + '</strong><br>' +
+              '<span style="font-size:12px;color:#9b8b78;">' + (item.type||'') + ' · ¥' + (item.price_per_piece||item.price||'?') + '/颗</span></div>' +
+            '<div style="text-align:right;min-width:100px;">' +
+              '<span' + low + '>库存：' + item.stock + '</span>' + soldOut + '<br>' +
+              '<button onclick="stockIn(\'' + item.name.replace(/'/g,"\\'") + '\')" style="font-size:11px;padding:2px 8px;margin-right:4px;border:1px solid #27ae60;border-radius:4px;background:#fff;color:#27ae60;cursor:pointer;">+1</button>' +
+              '<button onclick="stockOut(\'' + item.name.replace(/'/g,"\\'") + '\')" style="font-size:11px;padding:2px 8px;margin-right:4px;border:1px solid #c0392b;border-radius:4px;background:#fff;color:#c0392b;cursor:pointer;">-1</button>' +
+              '<button onclick="deletePearl(\'' + item.name.replace(/'/g,"\\'") + '\')" style="font-size:11px;padding:2px 6px;border:1px solid #e67e22;border-radius:4px;background:#fff;color:#e67e22;cursor:pointer;">🗑</button>' +
+            '</div></div>';
+        });
+        list.innerHTML = html;
+      } catch (err) {
+        list.innerHTML = '<div class="error">网络出问题了</div>';
+      }
+    }
+
+    async function stockIn(name) {
+      const amount = parseInt(prompt('入库多少颗？', '1'));
+      if (!amount || amount <= 0) return;
+      try {
+        const resp = await fetch('/api/inventory/stock-in', {
+          method: 'POST', headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({name: name, amount: amount}),
+        });
+        const data = await resp.json();
+        if (data.ok) { showToast('+' + amount + ' ✅'); loadInventory(); }
+        else { showToast('失败：' + (data.error || '')); }
+      } catch (err) { showToast('网络错误'); }
+    }
+
+    async function stockOut(name) {
+      const amount = parseInt(prompt('出库多少颗？', '1'));
+      if (!amount || amount <= 0) return;
+      try {
+        const resp = await fetch('/api/inventory/stock-out', {
+          method: 'POST', headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({name: name, amount: amount}),
+        });
+        const data = await resp.json();
+        if (data.ok) { showToast('-' + amount + ' ✅'); loadInventory(); }
+        else { showToast('失败：' + (data.error || '')); }
+      } catch (err) { showToast('网络错误'); }
+    }
+
+    async function deletePearl(name) {
+      if (!confirm('确定删除「' + name + '」吗？这个操作不可恢复！')) return;
+      try {
+        const resp = await fetch('/api/inventory/delete', {
+          method: 'POST', headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({name: name}),
+        });
+        const data = await resp.json();
+        if (data.ok) { showToast('已删除 ✅'); loadInventory(); }
+        else { showToast('失败：' + (data.error || '')); }
+      } catch (err) { showToast('网络错误'); }
+    }
+
+    function toggleAddForm() {
+      const form = document.getElementById('add-pearl-form');
+      form.style.display = form.style.display === 'none' ? 'block' : 'none';
+    }
+
+    async function addNewPearl() {
+      const name = document.getElementById('new-pearl-name').value.trim();
+      const type = document.getElementById('new-pearl-type').value.trim();
+      const price = parseFloat(document.getElementById('new-pearl-price').value);
+      const stock = parseInt(document.getElementById('new-pearl-stock').value);
+      const grade = document.getElementById('new-pearl-grade').value.trim();
+      if (!name || !type || !price || !stock) { showToast('请填完名字、类型、单价、库存'); return; }
+      try {
+        const resp = await fetch('/api/inventory/update', {
+          method: 'POST', headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({name, type, price_per_piece: price, stock, grade}),
+        });
+        const data = await resp.json();
+        if (data.ok) {
+          showToast('已添加 ✅');
+          document.getElementById('new-pearl-name').value = '';
+          document.getElementById('new-pearl-type').value = '';
+          document.getElementById('new-pearl-price').value = '';
+          document.getElementById('new-pearl-stock').value = '';
+          document.getElementById('new-pearl-grade').value = '';
+          document.getElementById('add-pearl-form').style.display = 'none';
+          loadInventory();
+        } else { showToast('失败：' + (data.error || '')); }
+      } catch (err) { showToast('网络错误'); }
+    }
+  </script>
+</body>
+</html>
