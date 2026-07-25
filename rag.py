@@ -213,18 +213,23 @@ _BUDGET_RANGE_MAP = [
 ]
 
 def _expand_budget_range(query: str) -> str:
-    """输入 '预算6000' →检测数字6000在5000-999999范围→追加'5000-10000'"""
+    """输入 '预算6000' →检测数字6000在5000-10000范围→追加'5000-10000'
+
+    边界值（如 5000 同时在 3000-5000 和 5000-10000 的边界）→ 追加两个标签。
+    """
     budget_pat = re.compile(r'预算\s*(\d+)')
     m = budget_pat.search(query)
     if not m:
         return query
     budget = int(m.group(1))
+    matched_tags = []
     for lo, hi, tag in _BUDGET_RANGE_MAP:
         if lo <= budget <= hi:
             if tag not in query:
-                retrieval_logger.info("✏️ 预算扩展: %d元 → '%s'", budget, tag)
-                return f"{query} {tag}"
-            break
+                matched_tags.append(tag)
+    if matched_tags:
+        retrieval_logger.info("✏️ 预算扩展: %d元 → %s", budget, matched_tags)
+        return f"{query} {' '.join(matched_tags)}"
     return query
 
 
