@@ -260,19 +260,19 @@ def _call_llm_chat(messages: list[dict], temperature: float = 0.7, max_tokens: i
 #
 # 面试话术：
 # "Agent 部分没用 LangGraph，自己写了 ReAct 循环。
-#  工具粒度刻意拆成 search_knowledge / check_inventory 两个，
-#  LLM 先查知识库，根据结果再决定要不要查库存——而不是代码写死全查。
-#  坦诚说以现在的用户量和工具数量，硬编码也够用。
-#  但我想真正理解 Agent 的决策链路，所以从零实现了一遍。"
+#  LLM 面对 2 个工具有三种选择：直接用初步检索结果、
+#  换角度再搜知识库、查库存——不是 if-else，是真正的决策。
+#  生成后加了一轮自检：编造检查、预算检查、款式检查，
+#  相当于 Agent 自己审核自己。纠错比人快。"
 # ============================================================
 
 _TOOLS: dict[str, dict] = {
     "search_knowledge": {
-        "desc": "搜索珍珠知识库。获取珍珠知识、搭配建议、保养方法、鉴别技巧。",
-        "params": {"query": "搜索关键词，如'圆脸适合什么珍珠'"},
+        "desc": "搜索珍珠知识库。当初步检索结果不够、或需要从不同角度补充信息时调用。",
+        "params": {"query": "换个角度的搜索词，如初步搜了'圆脸珍珠'但不够→搜'圆脸显脸小搭配'"},
     },
     "check_inventory": {
-        "desc": "查看珍珠库存（种类、价格、尺码、数量）。当客户有预算信息、表达了购买意向、或需要推荐具体珠子/报价时，必须调用此工具。不要凭空推荐产品。",
+        "desc": "查看珍珠库存（种类、价格、尺码、数量）。客户有购买意向时调用。",
         "params": {"keyword": "关键词，如'Akoya'、'淡水'、'7-8mm'"},
     },
 }
@@ -287,22 +287,33 @@ def _react_system_prompt(user_type: str) -> str:
     )
     return f"""{base}
 
-【可用工具 — search_knowledge 已自动执行，你只需按需调用 check_inventory】
+【可用工具 — 你可自主决定是否调用、调哪个、调几次】
 {tools_desc}
 
 【工作方式】
-- 知识库内容已经在下面的消息里了，你直接用
-- 客户有预算/想买/要推荐 → 调用 check_inventory 查库存（输出 JSON）
-- 纯知识问题（怎么保养/怎么辨别真假等）→ 直接用知识库内容回复，不需要调工具
-- 调工具时只输出一行 JSON：
-{{"tool":"check_inventory","args":{{"keyword":"关键词"}}}}
-- 不调工具时直接输出纯文本回复
+- 下面消息中的知识库/库存是系统初步检索的结果，作为参考起点
+- 如果觉得信息不够或角度不对，调用 search_knowledge 换关键词再搜
+- 客户有购买意向 → 调用 check_inventory 查库存
+- 信息足够后直接输出纯文本回复
+- 调工具时只输出一行 JSON，如：
+{{"tool":"search_knowledge","args":{{"query":"换角度搜索词"}}}}
+{{"tool":"check_inventory","args":{{"keyword":"品种名"}}}}
 
-【结尾铁律 — 最高优先级】
-1. 客户说想买什么就推什么，不要替客户拒绝！不准说"太大了"、"太张扬了"、"不适合"、"偏大"。客户自己会判断合不合适
-2. 客户预算范围内推最好的，不准推远低于预算的便宜货——预算2000就别推600的
-3. 客户没问价格就不要报价格
-4. 推荐完直接停。不准反问客户任何问题（比如"想买项链还是耳钉"）——每次对话是独立的，没有下一轮"""
+【生成后自检 — 最高优先级】
+回复客户前，在脑中逐条检查：
+1. 产品名、价格是否全部来自库存数据？→ 不是则删掉
+2. 是否超出客户预算？→ 超了则换便宜的
+3. 推荐的是珠子品种（如'Akoya 7-8mm'）还是成品款式（全珠链/吊坠/耳钉）？→ 只推珠子
+4. 有没有编造知识库没有的内容？→ 有则删掉
+有问题自己修正后再输出，不要在回复里写检查过程。
+
+【结尾铁律】
+1. 客户说想买什么就推什么，不替客户拒绝
+2. 预算范围内推最好的，不推远低于预算的便宜货
+3. 客户没问价格不报价格
+4. 推荐完直接停，不反问客户问题
+5. 不编造、不虚构——不知道就说"姐帮你找找"
+"""
 
 
 
@@ -406,7 +417,7 @@ async def _agentic_reply(req: ReplyRequest) -> tuple[str, list[str]]:
         kb_text = "\n\n".join(
             f"[知识条目{i + 1}]\n{d}" for i, d in enumerate(kb_docs)
         )
-        retrieval_msg = f"【已自动检索到的知识库内容】\n{kb_text}\n\n{user_msg}"
+        retrieval_msg = f"【知识库初步检索 — 作为参考，你仍可自行搜索】\n{kb_text}\n\n{user_msg}"
     else:
         had_low_conf = True
         retrieval_msg = user_msg
@@ -433,14 +444,29 @@ async def _agentic_reply(req: ReplyRequest) -> tuple[str, list[str]]:
         action = _parse_action(resp)
 
         if action is None:
-            # 不是 JSON → LLM 给出了最终回复
-            verif = _verify_attribution(resp, all_docs)
+            # ---- 自检轮：Agent 审核自己的回复 ----
+            messages.append({"role": "assistant", "content": resp})
+            messages.append({"role": "user", "content": (
+                "【自检】逐条确认：1) 产品名和价格是否全部来自上面的库存数据？"
+                "2) 有没有超出客户预算？"
+                "3) 推荐的是珠子品种还是成品款式？只推珠子。"
+                "4) 有没有编造知识库没有的内容？"
+                "如有问题，输出修正后的回复；如无问题，直接输出原回复。"
+                "不要输出检查过程，只输出最终回复。"
+            )})
+            checked = _call_llm_chat(messages, temperature=0.3)
+
+            # 防 JSON 泄漏：自检结果不能是工具调用
+            if _parse_action(checked) is not None or checked.strip().startswith("{"):
+                checked = resp
+
+            verif = _verify_attribution(checked, all_docs)
             _agentic_metrics.record_reply(
                 short_circuit=had_low_conf,
                 self_check=tool_used,
                 attribution_hallucination=bool(verif["hallucinated"]),
             )
-            return _strip_meta_lines(resp, all_docs), all_docs
+            return _strip_meta_lines(checked, all_docs), all_docs
 
         # 执行 LLM 请求的工具（主要是 check_inventory）
         tool_used = True
@@ -739,11 +765,8 @@ async def api_reply(req: ReplyRequest):
 
 @app.post("/api/reply/stream")
 async def api_reply_stream(req: ReplyRequest):
-    """ReAct 流式：LLM 自主决策工具调用 → 实时流式输出最终回复。
+    """ReAct 流式：初步检索 → Agent 自主决策工具调用 → 生成 → 自检 → 流式输出。"""
 
-    流程：分析 → 调工具（可多轮）→ 最终回复流式输出。
-    相比旧版少了单独的"自检-修正"环节——ReAct 循环内 LLM 不确定时会自己再查。
-    """
 
     async def event_stream():
         try:
@@ -774,7 +797,7 @@ async def api_reply_stream(req: ReplyRequest):
                 kb_text = "\n\n".join(
                     f"[知识条目{i + 1}]\n{d}" for i, d in enumerate(kb_docs)
                 )
-                retrieval_msg = f"【已自动检索到的知识库内容】\n{kb_text}\n\n{user_msg}"
+                retrieval_msg = f"【知识库初步检索 — 作为参考，你仍可自行搜索】\n{kb_text}\n\n{user_msg}"
             else:
                 had_low_conf = True
                 retrieval_msg = user_msg
@@ -804,12 +827,26 @@ async def api_reply_stream(req: ReplyRequest):
                 action = _parse_action(resp)
 
                 if action is None:
-                    # LLM 给出最终回复 → 先过滤再流式输出
+                    # ---- 自检轮：Agent 审核自己的回复 ----
+                    yield _sse({"status": "checking"})
+                    messages.append({"role": "assistant", "content": resp})
+                    messages.append({"role": "user", "content": (
+                        "【自检】逐条确认：1) 产品名和价格是否全部来自上面的库存数据？"
+                        "2) 有没有超出客户预算？"
+                        "3) 推荐的是珠子品种还是成品款式？只推珠子。"
+                        "4) 有没有编造知识库没有的内容？"
+                        "如有问题，输出修正后的回复；如无问题，直接输出原回复。"
+                        "不要输出检查过程，只输出最终回复。"
+                    )})
+                    checked = _call_llm_chat(messages, temperature=0.3)
+                    if _parse_action(checked) is not None or checked.strip().startswith("{"):
+                        checked = resp
+
+                    # 流式输出自检后的回复
                     yield _sse({"status": "generating"})
-                    final_reply = _strip_meta_lines(resp, all_docs)
+                    final_reply = _strip_meta_lines(checked, all_docs)
                     if not final_reply.strip():
                         final_reply = "不好意思宝，刚刚信息有点多，姐重新帮你看一下哈 ❤️"
-                    # 按 3 个字符分块模拟打字机效果
                     for i in range(0, len(final_reply), 3):
                         yield _sse({"token": final_reply[i:i+3]})
                         await asyncio.sleep(0.02)

@@ -20,8 +20,7 @@ from datetime import datetime, timezone
 import jieba
 from rank_bm25 import BM25Okapi
 from sentence_transformers import SentenceTransformer
-import chromadb
-from chromadb.config import Settings
+from langchain_chroma import Chroma
 from pathlib import Path
 from openai import OpenAI
 
@@ -55,13 +54,30 @@ COLLECTION_NAME = "pearl_knowledge"
 EMBEDDING_MODEL = "paraphrase-multilingual-MiniLM-L12-v2"
 
 # ============================================================
+# LangChain 适配：sentence-transformers → LangChain embedding 接口
+# ============================================================
+class _STEmbeddings:
+    """把 sentence-transformers 包装成 LangChain 兼容的 embedding 接口"""
+
+    def __init__(self, model: SentenceTransformer):
+        self._model = model
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        return self._model.encode(texts).tolist()
+
+    def embed_query(self, text: str) -> list[float]:
+        return self._model.encode([text]).tolist()[0]
+
+
+# ============================================================
 # 懒加载状态 — initialize() 调用前全部为 None / 空
 # ============================================================
 _embedding_model: SentenceTransformer | None = None
-_collection = None
+_vectorstore: Chroma | None = None
 _all_ids: list[str] = []
 _all_documents: list[str] = []
 _id_to_doc: dict[str, str] = {}
+_doc_to_id: dict[str, str] = {}
 _bm25: BM25Okapi | None = None
 _llm_client: OpenAI | None = None
 _initialized: bool = False
@@ -71,31 +87,34 @@ _initialized: bool = False
 # 初始化（由 app.py 的 lifespan 调用，不再在 import 时执行）
 # ============================================================
 def initialize():
-    """加载 Embedding 模型、连接 ChromaDB、构建 BM25 索引。
+    """加载 Embedding 模型、通过 LangChain Chroma 连接向量库、构建 BM25 索引。
     必须在服务启动时调用一次，否则所有检索函数会抛出 RuntimeError。
     """
-    global _embedding_model, _collection
-    global _all_ids, _all_documents, _id_to_doc, _bm25, _initialized
+    global _embedding_model, _vectorstore
+    global _all_ids, _all_documents, _id_to_doc, _doc_to_id, _bm25, _initialized
 
     print(f"正在加载 Embedding 模型: {EMBEDDING_MODEL} ...")
     _embedding_model = SentenceTransformer(EMBEDDING_MODEL)
 
-    _chroma_client = chromadb.PersistentClient(
-        path=str(CHROMA_DIR),
-        settings=Settings(anonymized_telemetry=False),
+    # 用 LangChain Chroma 封装（替代原生 chromadb.PersistentClient）
+    _vectorstore = Chroma(
+        embedding_function=_STEmbeddings(_embedding_model),
+        persist_directory=str(CHROMA_DIR),
+        collection_name=COLLECTION_NAME,
     )
-    _collection = _chroma_client.get_collection(name=COLLECTION_NAME)
 
-    all_data = _collection.get()
+    # 提取全量文档用于 BM25 和 Rerank
+    all_data = _vectorstore.get(include=["documents"])
     _all_ids = list(all_data.get("ids", []))
     _all_documents = list(all_data.get("documents", []))
     _id_to_doc = dict(zip(_all_ids, _all_documents))
+    _doc_to_id = dict(zip(_all_documents, _all_ids))
 
     tokenized_corpus = [list(jieba.cut(doc)) for doc in _all_documents]
     _bm25 = BM25Okapi(tokenized_corpus) if tokenized_corpus else None
 
     _initialized = True
-    print(f"知识库就绪 — {len(_all_documents)} 条文档，BM25 索引已构建")
+    print(f"知识库就绪 — {len(_all_documents)} 条文档，BM25 索引已构建（LangChain Chroma）")
 
 
 def _ensure_initialized():
@@ -312,22 +331,20 @@ def bm25_search(query: str, top_k: int = 15) -> list[tuple[str, str, float]]:
 
 
 async def vector_search(query: str, top_k: int = 15) -> list[tuple[str, str, float]]:
-    """向量语义检索（异步）。返回 [(doc_id, doc_content, similarity), ...]"""
+    """向量语义检索（通过 LangChain Chroma，异步）。返回 [(doc_id, doc_content, similarity), ...]"""
     _ensure_initialized()
-    query_embedding = await asyncio.to_thread(
-        _embedding_model.encode, [query]
+    # LangChain Chroma 的 similarity_search_with_score 内部处理了 embedding
+    results = await asyncio.to_thread(
+        _vectorstore.similarity_search_with_score, query, k=top_k
     )
-    results = _collection.query(
-        query_embeddings=query_embedding.tolist(),
-        n_results=top_k,
-    )
-    ids = results.get("ids", [[]])[0]
-    docs = results.get("documents", [[]])[0]
-    distances = results.get("distances", [[]])[0]
-    return [
-        (id_, doc, 1.0 - dist)
-        for id_, doc, dist in zip(ids, docs, distances)
-    ]
+    output: list[tuple[str, str, float]] = []
+    for doc, score in results:
+        # Chroma cosine 距离 → 相似度
+        sim = 1.0 - score
+        doc_id = _doc_to_id.get(doc.page_content, "")
+        if doc_id:
+            output.append((doc_id, doc.page_content, sim))
+    return output
 
 
 def rrf_fusion(
