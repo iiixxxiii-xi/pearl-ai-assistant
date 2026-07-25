@@ -23,6 +23,10 @@ import argparse
 from pathlib import Path
 from dotenv import load_dotenv
 
+# Windows GBK 编码兼容：强制 stdout 用 UTF-8
+if sys.platform == "win32":
+    sys.stdout.reconfigure(encoding="utf-8")
+
 load_dotenv(Path(__file__).parent / ".env")
 
 # 确保 rag 能 import
@@ -318,12 +322,7 @@ async def run_evaluation(verbose: bool = False, use_llm: bool = True):
         else:
             print("   评级: D — 检索或知识库有严重问题")
 
-    print(f"\n💡 面试话术:")
-    if recall_scores:
-        print(f"   '检索召回率 {avg_recall:.0%}，Faithfulness {avg_faith:.1f}/5，Negative Rejection {neg_rate:.0%}'")
-    print(f"   '每个指标我都知道怎么测、怎么改进'")
     print()
-
     return results
 
 

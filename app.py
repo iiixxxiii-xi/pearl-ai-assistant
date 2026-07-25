@@ -254,6 +254,27 @@ def _call_llm_chat(messages: list[dict], temperature: float = 0.7, max_tokens: i
         return ""
 
 
+def _build_user_message(req: ReplyRequest, docs: list[str]) -> str:
+    """构建发给 LLM 的用户消息：客户画像 + 知识库文档 + 客户问题。
+    evaluate.py 依赖此函数做全链路评估。
+    """
+    user_msg = f"客户问题：{req.question}"
+
+    profile = build_customer_profile_prompt(
+        req.trait, req.knowledge_level, req.budget_range, req.usage, req.quality,
+    )
+    if profile:
+        user_msg = profile + "\n\n" + user_msg
+
+    if docs:
+        kb_text = "\n\n".join(
+            f"[知识条目{i + 1}]\n{d}" for i, d in enumerate(docs)
+        )
+        user_msg = f"【知识库参考】\n{kb_text}\n\n{user_msg}"
+
+    return user_msg
+
+
 # ============================================================
 # ReAct Agent — 工具调度层
 # LLM 自主决定调哪些工具、调几次、什么顺序。
