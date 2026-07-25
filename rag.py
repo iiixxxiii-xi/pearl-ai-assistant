@@ -180,6 +180,68 @@ REWRITE_SYSTEM_PROMPT = """你是珍珠行业的检索助手。客户输入可�
 5. 只输出改写后的查询，不要任何解释"""
 
 
+# 年龄数字→年龄段映射，让 "25岁" 能匹配知识库里的 "20多岁年轻女生"
+_AGE_EXPAND = [
+    (re.compile(r'(\d{2})岁'), lambda age: _age_to_range(int(age))),
+]
+
+def _age_to_range(age: int) -> str:
+    """把具体年龄映射到知识库里的年龄段表述（只加一个词，避免淹没其他关键词）"""
+    if age < 20:
+        return "十几岁"
+    elif age < 30:
+        return "20多岁"
+    elif age < 40:
+        return "30多岁"
+    elif age < 50:
+        return "40多岁"
+    elif age < 60:
+        return "50多岁"
+    else:
+        return "60多岁"
+
+# 预算数字→知识库范围映射，让 "6000" 能匹配 "预算5000-10000"
+_BUDGET_RANGE_MAP = [
+    # (min, max, keyword_to_append)
+    (150, 350, "200-300"),
+    (350, 700, "500左右"),
+    (700, 1400, "1000左右"),
+    (1000, 2000, "1000-2000"),
+    (2000, 3000, "2000-3000"),
+    (3000, 5000, "3000-5000"),
+    (5000, 10000, "5000-10000"),
+]
+
+def _expand_budget_range(query: str) -> str:
+    """输入 '预算6000' →检测数字6000在5000-999999范围→追加'5000-10000'"""
+    budget_pat = re.compile(r'预算\s*(\d+)')
+    m = budget_pat.search(query)
+    if not m:
+        return query
+    budget = int(m.group(1))
+    for lo, hi, tag in _BUDGET_RANGE_MAP:
+        if lo <= budget <= hi:
+            if tag not in query:
+                retrieval_logger.info("✏️ 预算扩展: %d元 → '%s'", budget, tag)
+                return f"{query} {tag}"
+            break
+    return query
+
+
+def _expand_age_range(query: str) -> str:
+    """检测 query 中的年龄数字，追加对应的年龄段关键词"""
+    for pat, mapper in _AGE_EXPAND:
+        m = pat.search(query)
+        if m:
+            age = int(m.group(1))
+            if 10 <= age <= 99:  # 合理年龄范围
+                expansion = mapper(age)
+                if expansion not in query:
+                    retrieval_logger.info("✏️ 年龄扩展: %d岁 → '%s'", age, expansion)
+                    return f"{query} {expansion}"
+    return query
+
+
 async def _maybe_rewrite_query(query: str) -> tuple[str, bool]:
     """短/口语查询自动改写。返回 (rewritten_query, was_rewritten)。"""
     # 长度够且包含明确关键词 → 跳过改写
@@ -195,7 +257,7 @@ async def _maybe_rewrite_query(query: str) -> tuple[str, bool]:
     try:
         resp = await asyncio.to_thread(
             lambda: _llm_client.chat.completions.create(
-                model="deepseek-chat",
+                model="deepseek-v4-flash",
                 messages=[
                     {"role": "system", "content": REWRITE_SYSTEM_PROMPT},
                     {"role": "user", "content": f"改写：{query}"},
@@ -280,11 +342,12 @@ def rrf_fusion(
 # ---- 领域关键词词典：提取 query 中的强约束信号 ----
 _DOMAIN_PATTERNS: list[tuple[str, str]] = [
     # (正则, 类别名)
+    (r"(十几岁|20多岁|30多岁|40多岁|50多岁|60多岁)", "年龄"),
     (r"预算\s*(\d+)\s*(块|元|百|千|万|以内|左右|上下)?", "预算"),
     (r"(\d+)\s*(块|元|百|千|万|以内|左右|上下|预算)", "预算"),
     (r"(海水|淡水|Akoya|akoya|大溪地|南洋金珠|马贝|爱迪生|巴洛克|keshi)", "材质"),
     (r"(圆脸|长脸|方脸|瓜子脸|鹅蛋脸|国字脸|显脸|脸型|脸大)", "脸型"),
-    (r"(送妈妈|送长辈|送女友|送闺蜜|送婆婆|送岳母|生日|结婚|婚礼|礼物|本命年)", "用途"),
+    (r"(送妈妈|送长辈|送女友|送闺蜜|送婆婆|送岳母|买给妈妈|给妈妈|送人|生日|结婚|婚礼|礼物|本命年)", "用途"),
     (r"(日常|上班|通勤|百搭|配衣服|正式|职场|休闲)", "场景"),
     (r"(7-8mm|8-9mm|9-10mm|10mm|12mm|小米珠|小尺寸|大尺寸|点位|直径)", "尺寸"),
     (r"(正圆|近圆|水滴|馒头|椭圆|异形|螺纹)", "形状"),
@@ -292,36 +355,43 @@ _DOMAIN_PATTERNS: list[tuple[str, str]] = [
 ]
 
 
-def _extract_domain_keywords(query: str) -> list[str]:
-    """从查询中提取领域关键词（预算数字、材质、脸型等强信号词）。
-    用 finditer 而非 search——同一模式可能命中多次（如"大溪地"和"生日"都匹配用途）。"""
-    keywords: list[str] = []
-    for pattern, _category in _DOMAIN_PATTERNS:
-        for m in re.finditer(pattern, query):
-            keywords.append(m.group(0))
-    return keywords
+def _extract_query_categories(query: str) -> set[str]:
+    """提取 query 命中的领域类别（不是具体关键词，是类别标签）。
+
+    比如 "买给妈妈 送人" → {"用途"}，"预算3000 日常" → {"预算", "场景"}。
+    """
+    categories: set[str] = set()
+    for pattern, category in _DOMAIN_PATTERNS:
+        if re.search(pattern, query):
+            categories.add(category)
+    return categories
 
 
 def _keyword_aware_rerank(query: str, doc_ids: list[str]) -> list[str]:
-    """领域关键词加权重排：匹配到关键词的文档排名提至前方。
+    """领域关键词加权重排：query 命中的类别，doc 只要匹配该类别任一模式就加分。
 
-    不改变 doc_ids 的去重和内容——只在 RRF 排序后、DeepSeek Rerank 前
-    做轻量调整。文档标题/首行命中了 query 关键词 → 排名前移。
+    核心改进：不再要求 exact keyword match。
+    query "送人" → 类别"用途" → doc "送长辈婆婆岳母" 含"送长辈" → 命中"用途"类 → 加分。
+    具体送谁（妈妈/婆婆/女友）由文本框的输入去精准匹配。
     """
-    keywords = _extract_domain_keywords(query)
-    if not keywords or len(doc_ids) <= 3:
+    query_categories = _extract_query_categories(query)
+    if not query_categories or len(doc_ids) <= 3:
         return doc_ids  # 没有领域关键词，不干预
 
     boost: dict[str, int] = {}
     for doc_id in doc_ids:
         doc_text = _id_to_doc.get(doc_id, "")
-        boost[doc_id] = sum(1 for kw in keywords if kw.lower() in doc_text.lower())
+        score = 0
+        for pattern, category in _DOMAIN_PATTERNS:
+            if category in query_categories and re.search(pattern, doc_text):
+                score += 1
+        boost[doc_id] = score
 
     retrieval_logger.info(
-        "关键词预过滤 — query 关键词: %s", keywords,
+        "关键词预过滤 — query 命中类别: %s", query_categories,
     )
     for doc_id in doc_ids[:8]:
-        doc_text = _id_to_doc.get(doc_id, "")[:60]
+        doc_text = _id_to_doc.get(doc_id, "")[:80]
         retrieval_logger.info(
             "  boost=%d doc=%s", boost.get(doc_id, 0), doc_text,
         )
@@ -342,7 +412,7 @@ def rerank_with_deepseek(query: str, candidate_ids: list[str], top_k: int = 3) -
 
     try:
         resp = _llm_client.chat.completions.create(
-            model="deepseek-chat",
+            model="deepseek-v4-flash",
             messages=[{"role": "user", "content": prompt}],
             temperature=0,
             max_tokens=50,
@@ -388,6 +458,10 @@ async def hybrid_search(query: str, top_k: int = 3) -> tuple[list[str], float]:
     # ---- Query 改写 ----
     rewritten_query, was_rewritten = await _maybe_rewrite_query(query)
     search_query = rewritten_query if was_rewritten else query
+
+    # ---- 年龄扩展 + 预算范围扩展 ----
+    search_query = _expand_age_range(search_query)
+    search_query = _expand_budget_range(search_query)
 
     retrieval_logger.info("── 检索开始 ── query=%s", search_query[:80])
 

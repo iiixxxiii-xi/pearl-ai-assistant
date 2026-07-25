@@ -64,7 +64,7 @@ def _get_chain():
         retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
 
         llm = ChatOpenAI(
-            model="deepseek-chat",
+            model="deepseek-v4-flash",
             api_key=DEEPSEEK_API_KEY,
             base_url=DEEPSEEK_BASE_URL,
             temperature=0.7,

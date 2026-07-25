@@ -219,10 +219,10 @@ def _verify_attribution(reply: str, docs: list[str]) -> dict:
 # ============================================================
 # Agentic RAG：检索 → 生成 → 自检 → 再检索 → 修正
 # ============================================================
-def _call_llm(system: str, user: str, temperature: float = 0.7, max_tokens: int = 600) -> str:
+def _call_llm(system: str, user: str, temperature: float = 0.7, max_tokens: int = 2048) -> str:
     """调用 DeepSeek，返回纯文本"""
     resp = _llm_client.chat.completions.create(
-        model="deepseek-chat",
+        model="deepseek-v4-flash",
         messages=[
             {"role": "system", "content": system},
             {"role": "user", "content": user},
@@ -233,15 +233,25 @@ def _call_llm(system: str, user: str, temperature: float = 0.7, max_tokens: int 
     return resp.choices[0].message.content.strip()
 
 
-def _call_llm_chat(messages: list[dict], temperature: float = 0.7, max_tokens: int = 600) -> str:
+def _call_llm_chat(messages: list[dict], temperature: float = 0.7, max_tokens: int = 2048) -> str:
     """调用 DeepSeek（多轮对话），返回纯文本"""
-    resp = _llm_client.chat.completions.create(
-        model="deepseek-chat",
-        messages=messages,
-        temperature=temperature,
-        max_tokens=max_tokens,
-    )
-    return resp.choices[0].message.content.strip()
+    try:
+        resp = _llm_client.chat.completions.create(
+            model="deepseek-v4-flash",
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+        finish = resp.choices[0].finish_reason
+        content = resp.choices[0].message.content
+        app_logger.info("📡 DeepSeek 返回: finish=%s len=%d", finish, len(content or ""))
+        if not content:
+            app_logger.warning("⚠️ DeepSeek 返回空内容, finish_reason=%s", finish)
+            return ""
+        return content.strip()
+    except Exception as e:
+        app_logger.error("❌ DeepSeek 调用失败: %s", e)
+        return ""
 
 
 # ============================================================
@@ -384,7 +394,13 @@ async def _agentic_reply(req: ReplyRequest) -> tuple[str, list[str]]:
     tool_used = False
 
     # ---- 强制预检索：知识库 + 库存，不等 LLM 决定 ----
-    kb_docs, kb_conf = await rag.hybrid_search(req.question)
+    # 下拉框的每个维度都喂进搜索，不只是文本框
+    search_terms = [req.question]
+    for val in [req.usage, req.quality, req.knowledge_level, req.trait]:
+        if val.strip():
+            search_terms.append(val.strip())
+    full_query = " ".join(search_terms)
+    kb_docs, kb_conf = await rag.hybrid_search(full_query)
     if kb_conf >= rag.SIMILARITY_FLOOR:
         all_docs.extend(kb_docs)
         kb_text = "\n\n".join(
@@ -424,7 +440,7 @@ async def _agentic_reply(req: ReplyRequest) -> tuple[str, list[str]]:
                 self_check=tool_used,
                 attribution_hallucination=bool(verif["hallucinated"]),
             )
-            return _strip_meta_lines(resp), all_docs
+            return _strip_meta_lines(resp, all_docs), all_docs
 
         # 执行 LLM 请求的工具（主要是 check_inventory）
         tool_used = True
@@ -455,7 +471,7 @@ async def _agentic_reply(req: ReplyRequest) -> tuple[str, list[str]]:
         final = _call_llm_chat(messages)
     if final.strip().startswith("{"):
         return "抱歉，我这边信息有点多，让我整理一下再回复您～", all_docs
-    return _strip_meta_lines(final), all_docs
+    return _strip_meta_lines(final, all_docs), all_docs
 
 
 # ============================================================
@@ -490,13 +506,28 @@ _PUSHY_PATTERNS = [
 ]
 
 
-def _strip_meta_lines(text: str) -> str:
-    """删除回复中的元数据行：📎参考标注、推销话术。"""
+def _strip_meta_lines(text: str, docs: list[str] | None = None) -> str:
+    """删除回复中的推销话术。📎参考保留发给用户（复制时手动删）。"""
     lines = text.split("\n")
-    # 过滤掉匹配推销模式的行 + 📎参考标注行
+    # 过滤前先解析 📎参考 行，打印真正的知识库条目（调试用）
+    for l in lines:
+        m = _REF_PATTERN.search(l.strip())
+        if m and docs:
+            # 从 "📎参考：条目1、条目3" 提取条目号
+            nums = [int(n) for n in re.findall(r'\d+', l)]
+            for n in nums:
+                if 1 <= n <= len(docs):
+                    title = docs[n - 1].split('\n')[0].strip()
+                    # 知识库格式 "问：..." → 提取问句
+                    q_match = re.search(r'问：(.+?)(?:答|$)', docs[n - 1])
+                    if q_match:
+                        title = q_match.group(1).strip()[:60]
+                    app_logger.info("📎 引用条目%d: %s", n, title)
+        elif m:
+            app_logger.info("📎 %s", l.strip())
+    # 过滤掉匹配推销模式的行（📎参考 保留，发给客户前手动删掉即可）
     lines = [l for l in lines
-             if not any(p.search(l.strip()) for p in _PUSHY_PATTERNS)
-             and not _REF_PATTERN.search(l.strip())]
+             if not any(p.search(l.strip()) for p in _PUSHY_PATTERNS)]
     # 去掉末尾空行
     while lines and not lines[-1].strip():
         lines.pop()
@@ -654,7 +685,7 @@ def _run_llm_stream(messages: list[dict], temperature: float,
     队列中放入 ("token", str) 或 ("done", None) 或 ("error", str)。"""
     try:
         resp = _llm_client.chat.completions.create(
-            model="deepseek-chat",
+            model="deepseek-v4-flash",
             messages=messages,
             temperature=temperature,
             max_tokens=max_tokens,
@@ -671,7 +702,7 @@ def _run_llm_stream(messages: list[dict], temperature: float,
 
 async def _stream_tokens(messages: list[dict],
                          temperature: float = 0.7,
-                         max_tokens: int = 600) -> AsyncGenerator[str, None]:
+                         max_tokens: int = 2048) -> AsyncGenerator[str, None]:
     """异步迭代器：从 DeepSeek 流中逐 token 产出，不阻塞事件循环。"""
     q: queue.Queue = queue.Queue()
     thread = threading.Thread(
@@ -730,8 +761,14 @@ async def api_reply_stream(req: ReplyRequest):
             tool_used = False
 
             # ---- 强制预检索：知识库 + 库存，不等 LLM 决定 ----
+            # 下拉框的每个维度都喂进搜索
             yield _sse({"status": "searching", "tool": "search_knowledge"})
-            kb_docs, kb_conf = await rag.hybrid_search(req.question)
+            search_terms = [req.question]
+            for val in [req.usage, req.quality, req.knowledge_level, req.trait]:
+                if val.strip():
+                    search_terms.append(val.strip())
+            full_query = " ".join(search_terms)
+            kb_docs, kb_conf = await rag.hybrid_search(full_query)
             if kb_conf >= rag.SIMILARITY_FLOOR:
                 all_docs.extend(kb_docs)
                 kb_text = "\n\n".join(
@@ -769,7 +806,9 @@ async def api_reply_stream(req: ReplyRequest):
                 if action is None:
                     # LLM 给出最终回复 → 先过滤再流式输出
                     yield _sse({"status": "generating"})
-                    final_reply = _strip_meta_lines(resp)
+                    final_reply = _strip_meta_lines(resp, all_docs)
+                    if not final_reply.strip():
+                        final_reply = "不好意思宝，刚刚信息有点多，姐重新帮你看一下哈 ❤️"
                     # 按 3 个字符分块模拟打字机效果
                     for i in range(0, len(final_reply), 3):
                         yield _sse({"token": final_reply[i:i+3]})
@@ -830,7 +869,7 @@ async def api_reply_stream(req: ReplyRequest):
                     yield _sse({"token": token})
 
             # 兜底路径也过滤推销话术
-            final_reply = _strip_meta_lines(final_reply)
+            final_reply = _strip_meta_lines(final_reply, all_docs)
             yield _sse({"done": True, "full_reply": final_reply})
 
         except RuntimeError as e:
@@ -869,7 +908,7 @@ async def api_content(req: ContentRequest):
         user_msg = f"请写一篇关于「{req.topic}」的小红书笔记。\n\n以下是珍珠知识库中相关内容，请以此为素材：\n\n{knowledge_text}"
 
         resp = _llm_client.chat.completions.create(
-            model="deepseek-chat",
+            model="deepseek-v4-flash",
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT_CONTENT},
                 {"role": "user", "content": user_msg},

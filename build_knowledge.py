@@ -148,6 +148,8 @@ def build_knowledge_base(chunks: list[str]):
 # 主流程
 # ============================================================
 if __name__ == "__main__":
+    import io
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
     print("=" * 55)
     print("🦪  珍珠 AI 助手 — 知识库构建工具")
     print("=" * 55)

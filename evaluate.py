@@ -152,7 +152,7 @@ def judge_with_llm(client: OpenAI, prompt: str) -> int:
     """用 LLM 打分，返回 0-5"""
     try:
         resp = client.chat.completions.create(
-            model="deepseek-chat",
+            model="deepseek-v4-flash",
             messages=[{"role": "user", "content": prompt}],
             temperature=0.0,
             max_tokens=10,
