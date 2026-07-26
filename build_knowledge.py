@@ -15,7 +15,7 @@ load_dotenv()
 
 import chromadb
 from chromadb.config import Settings
-from openai import OpenAI
+import requests
 
 
 # ============================================================
@@ -27,12 +27,8 @@ CHROMA_DIR = Path(__file__).parent / "chroma_db"
 COLLECTION_NAME = "pearl_knowledge"
 SPLIT_SEPARATOR = "\n\n"
 
-# Embedding API 配置
-EMBEDDING_API_KEY = os.getenv("DEEPSEEK_API_KEY")
-EMBEDDING_BASE_URL = os.getenv(
-    "EMBEDDING_BASE_URL",
-    "https://dashscope.aliyuncs.com/compatible-mode/v1",
-)
+# Embedding API 配置（通义千问原生 API）
+EMBEDDING_API_KEY = os.getenv("EMBEDDING_API_KEY") or os.getenv("DEEPSEEK_API_KEY")
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-v2")
 
 
@@ -73,16 +69,26 @@ def load_knowledge_files(data_dir: Path) -> list[str]:
 
 
 def build_knowledge_base(chunks: list[str]):
-    """用 DashScope Embedding API 向量化知识块，存入 ChromaDB"""
+    """用通义千问原生 Embedding API 向量化知识块，存入 ChromaDB"""
     print(f"\n🔗 连接 Embedding API: {EMBEDDING_MODEL} ...")
-    client = OpenAI(api_key=EMBEDDING_API_KEY, base_url=EMBEDDING_BASE_URL)
 
     def embed_batch(texts: list[str]) -> list[list[float]]:
         if not texts:
             return []
-        resp = client.embeddings.create(model=EMBEDDING_MODEL, input=texts)
-        sorted_data = sorted(resp.data, key=lambda x: x.index)
-        return [d.embedding for d in sorted_data]
+        resp = requests.post(
+            "https://dashscope.aliyuncs.com/api/v1/services/embeddings/text-embedding/text-embedding",
+            headers={
+                "Authorization": f"Bearer {EMBEDDING_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={"model": EMBEDDING_MODEL, "input": {"texts": texts}},
+            timeout=60,
+        )
+        if resp.status_code != 200:
+            raise RuntimeError(f"Embedding API {resp.status_code}: {resp.text[:200]}")
+        data = resp.json()
+        items = sorted(data["output"]["embeddings"], key=lambda e: e["text_index"])
+        return [item["embedding"] for item in items]
 
     # 创建 ChromaDB 客户端
     print(f"\n🗄️  正在连接 ChromaDB（存储目录：{CHROMA_DIR}）")

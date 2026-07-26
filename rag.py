@@ -11,6 +11,7 @@ import time
 import logging
 import threading
 import shutil
+import requests
 from datetime import datetime, timezone
 import jieba
 from rank_bm25 import BM25Okapi
@@ -21,12 +22,8 @@ from openai import OpenAI
 from prompts import RERANK_PROMPT
 from cache import cache
 
-# ---- Embedding API 配置（与 LLM API 分离，可独立配置） ----
-EMBEDDING_API_KEY = os.getenv("DEEPSEEK_API_KEY")  # 服务器上用通义千问的 key
-EMBEDDING_BASE_URL = os.getenv(
-    "EMBEDDING_BASE_URL",
-    "https://dashscope.aliyuncs.com/compatible-mode/v1",
-)
+# ---- Embedding API 配置（通义千问原生 API） ----
+EMBEDDING_API_KEY = os.getenv("EMBEDDING_API_KEY") or os.getenv("DEEPSEEK_API_KEY")
 EMBEDDING_MODEL_NAME = os.getenv("EMBEDDING_MODEL", "text-embedding-v2")
 
 # ---- 检索专用日志 ----
@@ -60,32 +57,43 @@ COLLECTION_NAME = "pearl_knowledge"
 # ============================================================
 class _APIEmbeddings:
     """把 DashScope Embedding API 包装成 LangChain 兼容的 embedding 接口。
-    不再本地加载模型——每次调用走 API，把 850MB+ 内存释放出来。
+    使用通义千问原生 API（不走 OpenAI 兼容模式），不再本地加载模型。
     """
 
-    def __init__(self, client: OpenAI, model: str):
-        self._client = client
+    def __init__(self, api_key: str, model: str):
+        self._api_key = api_key
         self._model = model
 
-    def embed_documents(self, texts: list[str]) -> list[list[float]]:
-        """批量编码文档（用于构建/重建向量库）"""
+    def _call_api(self, texts: list[str]) -> list[list[float]]:
+        """调通义千问原生文本 Embedding API"""
         if not texts:
             return []
-        resp = self._client.embeddings.create(model=self._model, input=texts)
-        # API 返回顺序可能不保证，按 index 排序
-        sorted_data = sorted(resp.data, key=lambda x: x.index)
-        return [d.embedding for d in sorted_data]
+        resp = requests.post(
+            "https://dashscope.aliyuncs.com/api/v1/services/embeddings/text-embedding/text-embedding",
+            headers={
+                "Authorization": f"Bearer {self._api_key}",
+                "Content-Type": "application/json",
+            },
+            json={"model": self._model, "input": {"texts": texts}},
+            timeout=60,
+        )
+        if resp.status_code != 200:
+            raise RuntimeError(f"Embedding API {resp.status_code}: {resp.text[:200]}")
+        data = resp.json()
+        # 按 text_index 排序保证顺序不变
+        items = sorted(data["output"]["embeddings"], key=lambda e: e["text_index"])
+        return [item["embedding"] for item in items]
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        return self._call_api(texts)
 
     def embed_query(self, text: str) -> list[float]:
-        """编码单条查询"""
-        resp = self._client.embeddings.create(model=self._model, input=[text])
-        return resp.data[0].embedding
+        return self._call_api([text])[0]
 
 
 # ============================================================
 # 懒加载状态 — initialize() 调用前全部为 None / 空
 # ============================================================
-_embedding_client: OpenAI | None = None
 _vectorstore: Chroma | None = None
 _all_ids: list[str] = []
 _all_documents: list[str] = []
@@ -101,7 +109,7 @@ _initialized: bool = False
 # ============================================================
 def _migrate_chroma_to_api(embedding_fn: _APIEmbeddings):
     """一次性迁移：把旧版 SentenceTransformer 向量库重建为 API embedding 向量库。
-    先读旧文档 → 确认成功后才删旧目录 → 用 API embedding 重建 → 写版本标记。
+    用 chromadb 自身 API 删旧集合（避免 Windows 文件锁），再用 LangChain Chroma 重建。
     """
     version_file = CHROMA_DIR / "embedding_version.txt"
     if version_file.exists():
@@ -124,21 +132,32 @@ def _migrate_chroma_to_api(embedding_fn: _APIEmbeddings):
         ids = list(data.get("ids", []))
         if docs:
             print(f"从旧版向量库提取了 {len(docs)} 条文档，开始迁移...")
+            # 用 chromadb API 删旧集合
+            old_client.delete_collection(COLLECTION_NAME)
+        del old_col
+        del old_client
+        # 清 chromadb 内部单例缓存，否则 LangChain Chroma 打不开同目录
+        import gc
+        gc.collect()
+        try:
+            from chromadb.api.client import SharedSystemClient
+            SharedSystemClient._identifier_to_system.pop(str(CHROMA_DIR), None)
+        except Exception:
+            pass
     except Exception as e:
         print(f"旧版向量库读取失败: {e}")
+        try:
+            del old_client
+        except Exception:
+            pass
 
-    # ⚠️ 只有成功提取到文档才删旧目录重建，否则保留旧数据
+    # 只有成功提取到文档才重建
     if not docs:
         print("未提取到旧文档，保留现有向量库，标记为 API 版本")
         version_file.write_text("api-v2")
         return
 
-    # 删除旧目录
-    if CHROMA_DIR.exists():
-        shutil.rmtree(str(CHROMA_DIR))
-    CHROMA_DIR.mkdir(parents=True, exist_ok=True)
-
-    # 用 API embedding 重建
+    # 用 LangChain Chroma 创建新集合（API embedding）
     new_vs = Chroma(
         embedding_function=embedding_fn,
         persist_directory=str(CHROMA_DIR),
@@ -157,19 +176,22 @@ def initialize():
     Embedding 改为 API 调用（DashScope text-embedding-v2），不再本地加载模型。
     如果 chroma_db 是旧版 SentenceTransformer 构建的，自动迁移。
     """
-    global _embedding_client, _vectorstore
+    global _vectorstore
     global _all_ids, _all_documents, _id_to_doc, _doc_to_id, _bm25, _initialized
 
-    # 创建 Embedding API 客户端
-    _embedding_client = OpenAI(
-        api_key=EMBEDDING_API_KEY,
-        base_url=EMBEDDING_BASE_URL,
-    )
-
-    embedding_fn = _APIEmbeddings(_embedding_client, EMBEDDING_MODEL_NAME)
+    embedding_fn = _APIEmbeddings(EMBEDDING_API_KEY, EMBEDDING_MODEL_NAME)
 
     # 自动迁移旧版向量库（仅首次）
     _migrate_chroma_to_api(embedding_fn)
+
+    # ⚠️ 清 chromadb 单例缓存——迁移函数里的旧 PersistentClient 可能还占着锁
+    import gc
+    gc.collect()
+    try:
+        from chromadb.api.client import SharedSystemClient
+        SharedSystemClient._identifier_to_system.clear()
+    except Exception:
+        pass
 
     # 用 LangChain Chroma 封装
     _vectorstore = Chroma(
