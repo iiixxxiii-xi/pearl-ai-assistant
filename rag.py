@@ -101,7 +101,7 @@ _initialized: bool = False
 # ============================================================
 def _migrate_chroma_to_api(embedding_fn: _APIEmbeddings):
     """一次性迁移：把旧版 SentenceTransformer 向量库重建为 API embedding 向量库。
-    读取旧文档 → 删除旧目录 → 用 API embedding 重建 → 写版本标记。
+    先读旧文档 → 确认成功后才删旧目录 → 用 API embedding 重建 → 写版本标记。
     """
     version_file = CHROMA_DIR / "embedding_version.txt"
     if version_file.exists():
@@ -122,14 +122,16 @@ def _migrate_chroma_to_api(embedding_fn: _APIEmbeddings):
         data = old_col.get(include=["documents"])
         docs = list(data.get("documents", []))
         ids = list(data.get("ids", []))
-        print(f"从旧版向量库提取了 {len(docs)} 条文档，开始迁移...")
+        if docs:
+            print(f"从旧版向量库提取了 {len(docs)} 条文档，开始迁移...")
     except Exception as e:
-        print(f"旧版向量库读取失败（将创建新库）: {e}")
-        # 如果 chroma_db 目录不存在或损坏，从零开始
-        if not CHROMA_DIR.exists():
-            CHROMA_DIR.mkdir(parents=True, exist_ok=True)
-            version_file.write_text("api-v2")
-            return
+        print(f"旧版向量库读取失败: {e}")
+
+    # ⚠️ 只有成功提取到文档才删旧目录重建，否则保留旧数据
+    if not docs:
+        print("未提取到旧文档，保留现有向量库，标记为 API 版本")
+        version_file.write_text("api-v2")
+        return
 
     # 删除旧目录
     if CHROMA_DIR.exists():
@@ -137,16 +139,14 @@ def _migrate_chroma_to_api(embedding_fn: _APIEmbeddings):
     CHROMA_DIR.mkdir(parents=True, exist_ok=True)
 
     # 用 API embedding 重建
-    if docs:
-        new_vs = Chroma(
-            embedding_function=embedding_fn,
-            persist_directory=str(CHROMA_DIR),
-            collection_name=COLLECTION_NAME,
-        )
-        print(f"正在用 API embedding 重建向量库（{len(docs)} 条文档）...")
-        new_vs.add_texts(texts=docs, ids=ids)
-        print("向量库重建完成")
-
+    new_vs = Chroma(
+        embedding_function=embedding_fn,
+        persist_directory=str(CHROMA_DIR),
+        collection_name=COLLECTION_NAME,
+    )
+    print(f"正在用 API embedding 重建向量库（{len(docs)} 条文档）...")
+    new_vs.add_texts(texts=docs, ids=ids)
+    print("向量库重建完成")
     version_file.write_text("api-v2")
 
 
