@@ -71,7 +71,7 @@
 | 关系库 | PostgreSQL | 对话记忆 + 反馈日志持久化 |
 | 缓存 | Redis | 检索结果缓存，自动降级内存 |
 | LLM | DeepSeek API | 国内直连，成本低 |
-| Embedding | sentence-transformers | 免费本地，中文效果好 |
+| Embedding | 通义千问 text-embedding-v2 API | 原生 API 调用，内存 0 占用，1536 维精度高 |
 | AI 框架 | LangChain | Chroma + LCEL 检索链；Agent ReAct 循环自己写 |
 | 工具协议 | MCP | 库存工具封装为 MCP Server，Agent 通过标准协议跨进程调用 |
 | 容器 | Docker Compose | 一键部署 |
