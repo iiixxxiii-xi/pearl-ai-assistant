@@ -1,31 +1,33 @@
 """RAG 检索链路 — BM25 + 向量 → RRF 融合 → DeepSeek Rerank
 
-注意：模型和数据库不在 import 时加载，而是由 app.py 通过 lifespan 调用 initialize()。
-这样 import 不会阻塞，测试也能在不加载模型的情况下 mock 整个模块。
+注意：数据库不在 import 时加载，而是由 app.py 通过 lifespan 调用 initialize()。
+Embedding 改为 API 调用（不再本地加载 SentenceTransformer 模型），内存占用从 1.2GB → ~200MB。
 """
 import os
-
-# ⚠️ 必须在 import sentence_transformers 之前设置，否则走的还是 huggingface.co
-#    setdefault 不够——如果系统或 .env 里已有值会跳过，这里直接显式覆盖
-os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
-os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "30")
-
 import asyncio
 import re
 import json
 import time
 import logging
 import threading
+import shutil
 from datetime import datetime, timezone
 import jieba
 from rank_bm25 import BM25Okapi
-from sentence_transformers import SentenceTransformer
 from langchain_chroma import Chroma
 from pathlib import Path
 from openai import OpenAI
 
 from prompts import RERANK_PROMPT
 from cache import cache
+
+# ---- Embedding API 配置（与 LLM API 分离，可独立配置） ----
+EMBEDDING_API_KEY = os.getenv("DEEPSEEK_API_KEY")  # 服务器上用通义千问的 key
+EMBEDDING_BASE_URL = os.getenv(
+    "EMBEDDING_BASE_URL",
+    "https://dashscope.aliyuncs.com/compatible-mode/v1",
+)
+EMBEDDING_MODEL_NAME = os.getenv("EMBEDDING_MODEL", "text-embedding-v2")
 
 # ---- 检索专用日志 ----
 retrieval_logger = logging.getLogger("pearl.retrieval")
@@ -51,28 +53,39 @@ REWRITE_MIN_LENGTH = 8
 # ============================================================
 CHROMA_DIR = Path(__file__).parent / "chroma_db"
 COLLECTION_NAME = "pearl_knowledge"
-EMBEDDING_MODEL = "paraphrase-multilingual-MiniLM-L12-v2"
+# EMBEDDING_MODEL_NAME 已在文件顶部从环境变量读取（默认 text-embedding-v2）
 
 # ============================================================
-# LangChain 适配：sentence-transformers → LangChain embedding 接口
+# LangChain 适配：DashScope Embedding API → LangChain embedding 接口
 # ============================================================
-class _STEmbeddings:
-    """把 sentence-transformers 包装成 LangChain 兼容的 embedding 接口"""
+class _APIEmbeddings:
+    """把 DashScope Embedding API 包装成 LangChain 兼容的 embedding 接口。
+    不再本地加载模型——每次调用走 API，把 850MB+ 内存释放出来。
+    """
 
-    def __init__(self, model: SentenceTransformer):
+    def __init__(self, client: OpenAI, model: str):
+        self._client = client
         self._model = model
 
     def embed_documents(self, texts: list[str]) -> list[list[float]]:
-        return self._model.encode(texts).tolist()
+        """批量编码文档（用于构建/重建向量库）"""
+        if not texts:
+            return []
+        resp = self._client.embeddings.create(model=self._model, input=texts)
+        # API 返回顺序可能不保证，按 index 排序
+        sorted_data = sorted(resp.data, key=lambda x: x.index)
+        return [d.embedding for d in sorted_data]
 
     def embed_query(self, text: str) -> list[float]:
-        return self._model.encode([text]).tolist()[0]
+        """编码单条查询"""
+        resp = self._client.embeddings.create(model=self._model, input=[text])
+        return resp.data[0].embedding
 
 
 # ============================================================
 # 懒加载状态 — initialize() 调用前全部为 None / 空
 # ============================================================
-_embedding_model: SentenceTransformer | None = None
+_embedding_client: OpenAI | None = None
 _vectorstore: Chroma | None = None
 _all_ids: list[str] = []
 _all_documents: list[str] = []
@@ -86,19 +99,81 @@ _initialized: bool = False
 # ============================================================
 # 初始化（由 app.py 的 lifespan 调用，不再在 import 时执行）
 # ============================================================
-def initialize():
-    """加载 Embedding 模型、通过 LangChain Chroma 连接向量库、构建 BM25 索引。
-    必须在服务启动时调用一次，否则所有检索函数会抛出 RuntimeError。
+def _migrate_chroma_to_api(embedding_fn: _APIEmbeddings):
+    """一次性迁移：把旧版 SentenceTransformer 向量库重建为 API embedding 向量库。
+    读取旧文档 → 删除旧目录 → 用 API embedding 重建 → 写版本标记。
     """
-    global _embedding_model, _vectorstore
+    version_file = CHROMA_DIR / "embedding_version.txt"
+    if version_file.exists():
+        return  # 已是 API 版本，无需迁移
+
+    docs: list[str] = []
+    ids: list[str] = []
+
+    # 尝试从旧版 chroma_db 提取文档
+    try:
+        import chromadb
+        from chromadb.config import Settings as CDBSettings
+        old_client = chromadb.PersistentClient(
+            path=str(CHROMA_DIR),
+            settings=CDBSettings(anonymized_telemetry=False),
+        )
+        old_col = old_client.get_collection(COLLECTION_NAME)
+        data = old_col.get(include=["documents"])
+        docs = list(data.get("documents", []))
+        ids = list(data.get("ids", []))
+        print(f"从旧版向量库提取了 {len(docs)} 条文档，开始迁移...")
+    except Exception as e:
+        print(f"旧版向量库读取失败（将创建新库）: {e}")
+        # 如果 chroma_db 目录不存在或损坏，从零开始
+        if not CHROMA_DIR.exists():
+            CHROMA_DIR.mkdir(parents=True, exist_ok=True)
+            version_file.write_text("api-v2")
+            return
+
+    # 删除旧目录
+    if CHROMA_DIR.exists():
+        shutil.rmtree(str(CHROMA_DIR))
+    CHROMA_DIR.mkdir(parents=True, exist_ok=True)
+
+    # 用 API embedding 重建
+    if docs:
+        new_vs = Chroma(
+            embedding_function=embedding_fn,
+            persist_directory=str(CHROMA_DIR),
+            collection_name=COLLECTION_NAME,
+        )
+        print(f"正在用 API embedding 重建向量库（{len(docs)} 条文档）...")
+        new_vs.add_texts(texts=docs, ids=ids)
+        print("向量库重建完成")
+
+    version_file.write_text("api-v2")
+
+
+def initialize():
+    """通过 LangChain Chroma 连接向量库、构建 BM25 索引。
+    必须在服务启动时调用一次，否则所有检索函数会抛出 RuntimeError。
+
+    Embedding 改为 API 调用（DashScope text-embedding-v2），不再本地加载模型。
+    如果 chroma_db 是旧版 SentenceTransformer 构建的，自动迁移。
+    """
+    global _embedding_client, _vectorstore
     global _all_ids, _all_documents, _id_to_doc, _doc_to_id, _bm25, _initialized
 
-    print(f"正在加载 Embedding 模型: {EMBEDDING_MODEL} ...")
-    _embedding_model = SentenceTransformer(EMBEDDING_MODEL)
+    # 创建 Embedding API 客户端
+    _embedding_client = OpenAI(
+        api_key=EMBEDDING_API_KEY,
+        base_url=EMBEDDING_BASE_URL,
+    )
 
-    # 用 LangChain Chroma 封装（替代原生 chromadb.PersistentClient）
+    embedding_fn = _APIEmbeddings(_embedding_client, EMBEDDING_MODEL_NAME)
+
+    # 自动迁移旧版向量库（仅首次）
+    _migrate_chroma_to_api(embedding_fn)
+
+    # 用 LangChain Chroma 封装
     _vectorstore = Chroma(
-        embedding_function=_STEmbeddings(_embedding_model),
+        embedding_function=embedding_fn,
         persist_directory=str(CHROMA_DIR),
         collection_name=COLLECTION_NAME,
     )
@@ -114,7 +189,7 @@ def initialize():
     _bm25 = BM25Okapi(tokenized_corpus) if tokenized_corpus else None
 
     _initialized = True
-    print(f"知识库就绪 — {len(_all_documents)} 条文档，BM25 索引已构建（LangChain Chroma）")
+    print(f"知识库就绪 — {len(_all_documents)} 条文档（API Embedding: {EMBEDDING_MODEL_NAME}）")
 
 
 def _ensure_initialized():

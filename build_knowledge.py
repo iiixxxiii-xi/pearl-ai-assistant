@@ -2,46 +2,38 @@
 build_knowledge.py — 珍珠知识库构建脚本
 把 data/ 文件夹里的 .txt 文件转成向量，存到 ChromaDB
 跑一次就行，以后知识库内容有改动就重新跑一遍
-"""
 
+Embedding 改为 DashScope API 调用（不再本地加载模型）。
+"""
 import os
 import sys
 from pathlib import Path
 
-# ⚠️ 必须在 import sentence_transformers 之前设置
-os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
-os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "30")
-
-# 加载 .env 里的配置（虽然这里不直接调 API，但保持项目一致性）
+# 加载 .env 里的配置
 from dotenv import load_dotenv
 load_dotenv()
 
-# ChromaDB：存向量 + 原文的轻量数据库
 import chromadb
 from chromadb.config import Settings
-
-# sentence-transformers：把中文文本转成向量
-from sentence_transformers import SentenceTransformer
+from openai import OpenAI
 
 
 # ============================================================
-# 配置区 —— 需要改的地方都在这
+# 配置区
 # ============================================================
 
-# 知识库源文件目录（放 .txt 文件的地方）
 DATA_DIR = Path(__file__).parent / "data"
-
-# ChromaDB 持久化存储目录（自动生成，不用手动创建）
 CHROMA_DIR = Path(__file__).parent / "chroma_db"
-
-# ChromaDB 里的集合名（相当于数据库里的"表"）
 COLLECTION_NAME = "pearl_knowledge"
-
-# 使用的 Embedding 模型（中文效果好、免费、本地跑）
-EMBEDDING_MODEL = "paraphrase-multilingual-MiniLM-L12-v2"
-
-# 分割符 —— 用空行来切分不同的问答块
 SPLIT_SEPARATOR = "\n\n"
+
+# Embedding API 配置
+EMBEDDING_API_KEY = os.getenv("DEEPSEEK_API_KEY")
+EMBEDDING_BASE_URL = os.getenv(
+    "EMBEDDING_BASE_URL",
+    "https://dashscope.aliyuncs.com/compatible-mode/v1",
+)
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-v2")
 
 
 def load_knowledge_files(data_dir: Path) -> list[str]:
@@ -81,67 +73,56 @@ def load_knowledge_files(data_dir: Path) -> list[str]:
 
 
 def build_knowledge_base(chunks: list[str]):
-    """
-    核心流程：
-    1. 加载 Embedding 模型
-    2. 把每个知识块转成向量
-    3. 把向量 + 原文一起存到 ChromaDB
-    """
-    print(f"\n🧠 正在加载 Embedding 模型：{EMBEDDING_MODEL}")
-    print("   （第一次用会从 HuggingFace 下载模型，大概几百MB，等一下就好）")
-    model = SentenceTransformer(EMBEDDING_MODEL, local_files_only=True)
-    print("   ✅ 模型加载完成")
+    """用 DashScope Embedding API 向量化知识块，存入 ChromaDB"""
+    print(f"\n🔗 连接 Embedding API: {EMBEDDING_MODEL} ...")
+    client = OpenAI(api_key=EMBEDDING_API_KEY, base_url=EMBEDDING_BASE_URL)
 
-    # 创建 ChromaDB 客户端（持久化存储，数据存到 chroma_db/ 目录）
+    def embed_batch(texts: list[str]) -> list[list[float]]:
+        if not texts:
+            return []
+        resp = client.embeddings.create(model=EMBEDDING_MODEL, input=texts)
+        sorted_data = sorted(resp.data, key=lambda x: x.index)
+        return [d.embedding for d in sorted_data]
+
+    # 创建 ChromaDB 客户端
     print(f"\n🗄️  正在连接 ChromaDB（存储目录：{CHROMA_DIR}）")
-    client = chromadb.PersistentClient(
+    chroma_client = chromadb.PersistentClient(
         path=str(CHROMA_DIR),
         settings=Settings(anonymized_telemetry=False)
     )
 
-    # 获取或创建集合。如果已存在同名集合就先删掉重建（保证每次构建都是最新数据）
+    # 删除旧集合（如果存在）
     try:
-        client.delete_collection(name=COLLECTION_NAME)
+        chroma_client.delete_collection(name=COLLECTION_NAME)
         print(f"   → 删除旧集合「{COLLECTION_NAME}」，准备重建")
     except Exception:
-        pass  # 集合不存在就不用删
+        pass
 
-    collection = client.create_collection(
+    collection = chroma_client.create_collection(
         name=COLLECTION_NAME,
         metadata={
             "description": "珍珠知识库 — 客服回复 + 小红书内容的共用知识",
-            "hnsw:space": "cosine",  # 余弦距离，1.0 - dist = 余弦相似度
+            "hnsw:space": "cosine",
         },
     )
 
     # 批量向量化并存入
-    print(f"\n🔢 正在将 {len(chunks)} 个知识块向量化并存入数据库...")
-    print("   （这一步需要一点时间，取决于知识库大小和你的电脑性能）")
-
-    batch_size = 10  # 每批处理 10 条，避免一次性吃太多内存
+    print(f"\n🔢 正在通过 API 向量化 {len(chunks)} 个知识块...")
+    batch_size = 10
     for i in range(0, len(chunks), batch_size):
         batch = chunks[i : i + batch_size]
-
-        # 生成每条数据的唯一 ID
         ids = [f"doc_{j}" for j in range(i, i + len(batch))]
-
-        # embedding 函数 —— 把每条文本转成向量
-        embeddings = model.encode(batch).tolist()
-
-        # 存入 ChromaDB：向量 + 原文 + ID
-        collection.add(
-            ids=ids,
-            embeddings=embeddings,
-            documents=batch
-        )
-
+        embeddings = embed_batch(batch)
+        collection.add(ids=ids, embeddings=embeddings, documents=batch)
         progress = min(i + batch_size, len(chunks))
         print(f"   → 已处理 {progress}/{len(chunks)} 条")
 
-    print(f"\n✅ 知识库构建完成，共 {len(chunks)} 条记录")
+    # 写版本标记（rag.py 的 _migrate_chroma_to_api 用）
+    (CHROMA_DIR / "embedding_version.txt").write_text("api-v2")
+
+    print(f"\n✅ 知识库构建完成，共 {len(chunks)} 条记录（API Embedding: {EMBEDDING_MODEL}）")
     print(f"   向量数据存储在：{CHROMA_DIR}")
-    print(f"   集合名称：{COLLECTION_NAME}")
-    print(f"\n💡 提示：以后知识库内容有改动，重新跑 python build_knowledge.py 就行")
+    print(f"\n💡 以后知识库内容有改动，重新跑 python build_knowledge.py 就行")
 
 
 # ============================================================
